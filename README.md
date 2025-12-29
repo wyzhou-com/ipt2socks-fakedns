@@ -1,3 +1,54 @@
+# ipt2socks with FakeDNS Support
+
+> **注意**：基于原版 `ipt2socks` 进行了增强，新增了 **FakeDNS** 功能。
+
+## 内置 FakeDNS 增强
+
+集成了专为透明代理环境深度优化的 FakeDNS 模块，并且与常规 FakeDNS 方案相比本方案拥有以下优点：
+
+1. **稳定映射**
+
+    不同于传统的“递增分配”或“随机分配” IP 策略，本方案采用确定性算法分配 IP，同一个地址池内同一个域名总是映射到同一个固定的 FakeIP。即使程序重启，映射关系依旧保持。
+
+2. **持久化与会话保持**
+
+    常规 FakeDNS 服务重启后内存映射丢失，因 DNS 缓存问题，客户端仍然可能通过持有的旧 FakeIP 发起连接，此时因服务器无映射数据，或数据不一致，导致无法路由，引发连接中断。本方案实现了数据持久化，通过 `--fakedns-cache` 选项，程序在退出时将映射数据保存到磁盘，并在下次启动时加载。
+
+3. **无感重启**
+
+    得益于以上两个特性，本方案保证了客户端和服务端 DNS 数据的一致性和连续性，服务重启不会导致连接中断。无需等待或手动刷新 DNS 缓存，实现了无感重启。
+
+### 参数说明
+
+在原有参数基础上，新增以下选项：
+
+```bash
+# [必须] 启用 FakeDNS
+--enable-fakedns
+
+# [可选] 监听配置 (默认 127.0.0.1:5353)
+--fakedns-addr 127.0.0.1
+--fakedns-port 5353
+
+# [可选] IP 池范围 (默认 198.18.0.0/15)
+--fakedns-ip-range 198.18.0.0/15
+
+# [强烈推荐] 持久化缓存路径
+# 启用后，程序会在退出时保存映射数据，启动时加载
+--fakedns-cache /var/cache/ipt2socks/fakedns.dat
+```
+
+#### 快速启动
+
+```bash
+mkdir -p /var/cache/ipt2socks
+ipt2socks -s 127.0.0.1 -p 1080 \
+  --enable-fakedns \
+  --fakedns-cache /var/cache/ipt2socks/fakedns.dat
+```
+
+---
+
 # ipt2socks(libev)
 
 类似 [redsocks](https://github.com/darkk/redsocks)、[redsocks2](https://github.com/semigodking/redsocks) 的实用工具，将 iptables/nftables (REDIRECT/TPROXY) 传入的流量转为 socks5(tcp/udp) 流量，除此之外不提供任何不必要的功能。
