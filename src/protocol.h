@@ -24,6 +24,7 @@
 
 /* address type constant definition */
 #define SOCKS5_ADDRTYPE_IPV4 0x01
+#define SOCKS5_ADDRTYPE_DOMAIN 0x03
 #define SOCKS5_ADDRTYPE_IPV6 0x04
 
 /* response code constant definition */
@@ -86,6 +87,17 @@ typedef struct {
     portno_t  portnum;
 } __attribute__((packed)) socks5_ipv6req_t;
 
+/* socks5 domain-proxy request */
+typedef struct {
+    uint8_t   version;
+    uint8_t   command;
+    uint8_t   reserved; /* 0x00 */
+    uint8_t   addrtype;
+    uint8_t   domain_len;
+    uint8_t   domain_str[]; /* variable length */
+    /* portno_t portnum; // follows domain_str */
+} __attribute__((packed)) socks5_domainreq_t;
+
 /* socks5 ipv4-proxy response */
 typedef struct {
     uint8_t   version;
@@ -126,6 +138,15 @@ typedef struct {
     uint8_t   payload[]; /* sizeof = 0 */
 } __attribute__((packed)) socks5_udp6msg_t;
 
+/* socks5 domain-udp message header */
+typedef struct {
+    uint16_t  reserved; /* 0x0000 */
+    uint8_t   fragment; /* 0x00 */
+    uint8_t   addrtype; /* SOCKS5_ADDRTYPE_DOMAIN (0x03) */
+    uint8_t   domain_len; /* domain length: 1-255 */
+    uint8_t   domain_str[]; /* domain string + portno_t (2 bytes) */
+} __attribute__((packed)) socks5_udp_domainmsg_t;
+
 extern socks5_authreq_t g_socks5_auth_request;
 
 extern char     g_socks5_usrpwd_request[];
@@ -135,7 +156,7 @@ extern const socks5_ipv4req_t G_SOCKS5_UDP4_REQUEST;
 extern const socks5_ipv6req_t G_SOCKS5_UDP6_REQUEST;
 
 void socks5_usrpwd_request_make(const char *username, const char *password);
-void socks5_proxy_request_make(socks5_ipv4req_t *request, const void *skaddr);
+void socks5_proxy_request_make(void *request, const void *skaddr, const char *domain, size_t *reqlen);
 
 bool socks5_auth_response_check(const char *funcname, const socks5_authresp_t *response);
 bool socks5_usrpwd_response_check(const char *funcname, const socks5_usrpwdresp_t *response);
