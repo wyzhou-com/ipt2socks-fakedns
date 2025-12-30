@@ -1,0 +1,101 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: ipt2socks@aarch64-linux-musl@generic+v8a
+            target: aarch64-linux-musl
+            cflags: -march=armv8-a
+          - name: ipt2socks@aarch64-linux-musl@generic+v9a
+            target: aarch64-linux-musl
+            cflags: -march=armv9-a
+          - name: ipt2socks@arm-linux-musleabi@generic+v7a
+            target: arm-linux-musleabi
+            cflags: -march=armv7-a
+          - name: ipt2socks@arm-linux-musleabihf@generic+v7a
+            target: arm-linux-musleabihf
+            cflags: -march=armv7-a
+          - name: ipt2socks@mips-linux-musl@mips32
+            target: mips-linux-musl
+            cflags: -mips32
+          - name: ipt2socks@mips-linux-musl@mips32+soft_float
+            target: mips-linux-musl
+            cflags: -mips32 -msoft-float
+          - name: ipt2socks@mips64-linux-musl@mips64
+            target: mips64-linux-musl
+            cflags: -mips64
+          - name: ipt2socks@mips64-linux-musl@mips64+soft_float
+            target: mips64-linux-musl
+            cflags: -mips64 -msoft-float
+          - name: ipt2socks@mips64el-linux-musl@mips64
+            target: mips64el-linux-musl
+            cflags: -mips64
+          - name: ipt2socks@mips64el-linux-musl@mips64+soft_float
+            target: mips64el-linux-musl
+            cflags: -mips64 -msoft-float
+          - name: ipt2socks@mipsel-linux-musl@mips32
+            target: mipsel-linux-musl
+            cflags: -mips32
+          - name: ipt2socks@mipsel-linux-musl@mips32+soft_float
+            target: mipsel-linux-musl
+            cflags: -mips32 -msoft-float
+          - name: ipt2socks@x86_64-linux-musl@x86_64
+            target: x86_64-linux-musl
+            cflags: -march=x86-64
+          - name: ipt2socks@x86_64-linux-musl@x86_64_v2
+            target: x86_64-linux-musl
+            cflags: -march=x86-64-v2
+          - name: ipt2socks@x86_64-linux-musl@x86_64_v3
+            target: x86_64-linux-musl
+            cflags: -march=x86-64-v3
+          - name: ipt2socks@x86_64-linux-musl@x86_64_v4
+            target: x86_64-linux-musl
+            cflags: -march=x86-64-v4
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download Toolchain
+        run: |
+          curl -LO "https://musl.cc/${{ matrix.target }}-cross.tgz"
+          tar -xf "${{ matrix.target }}-cross.tgz"
+          echo "$(pwd)/${{ matrix.target }}-cross/bin" >> $GITHUB_PATH
+
+      - name: Build
+        run: |
+          make CC="${{ matrix.target }}-gcc" CFLAGS="-std=c99 -Wall -Wextra -Wvla -pthread -O3 -flto -fno-strict-aliasing -ffunction-sections -fdata-sections -DNDEBUG ${{ matrix.cflags }}"
+          mv ipt2socks ${{ matrix.name }}
+          sha256sum ${{ matrix.name }} > ${{ matrix.name }}.sha256
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.name }}
+          path: |
+            ${{ matrix.name }}
+            ${{ matrix.name }}.sha256
+
+  release:
+    needs: build-and-release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download Artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/*
