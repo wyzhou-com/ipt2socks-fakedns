@@ -4,6 +4,7 @@ on:
   push:
     tags:
       - "v*"
+  workflow_dispatch:
 
 jobs:
   build-and-release:
@@ -15,15 +16,9 @@ jobs:
           - name: ipt2socks@aarch64-linux-musl@generic+v8a
             target: aarch64-linux-musl
             cflags: -march=armv8-a
-          - name: ipt2socks@aarch64-linux-musl@generic+v9a
-            target: aarch64-linux-musl
-            cflags: -march=armv9-a
-          - name: ipt2socks@arm-linux-musleabi@generic+v7a
+          - name: ipt2socks@arm-linux-musleabi@generic
             target: arm-linux-musleabi
-            cflags: -march=armv7-a
-          - name: ipt2socks@arm-linux-musleabihf@generic+v7a
-            target: arm-linux-musleabihf
-            cflags: -march=armv7-a
+            cflags: -march=armv5te
           - name: ipt2socks@mips-linux-musl@mips32
             target: mips-linux-musl
             cflags: -mips32
@@ -65,15 +60,14 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Download Toolchain
+      - name: Build with Docker
         run: |
-          curl -LO "https://musl.cc/${{ matrix.target }}-cross.tgz"
-          tar -xf "${{ matrix.target }}-cross.tgz"
-          echo "$(pwd)/${{ matrix.target }}-cross/bin" >> $GITHUB_PATH
+          docker run --rm -v "$(pwd):/src" -w /src muslcc/x86_64:${{ matrix.target }} \
+            /bin/sh -c "/bin/gcc -std=c99 -Wall -Wextra -Wvla -pthread -O3 -flto -fno-strict-aliasing -ffunction-sections -fdata-sections -DNDEBUG ${{ matrix.cflags }} -pthread -O3 -flto -fno-strict-aliasing -Wl,--gc-sections -s -o ipt2socks src/ipt2socks.c src/lrucache.c src/netutils.c src/protocol.c libev/ev.c src/fakedns.c src/xxhash.c -lm"
 
-      - name: Build
-        run: |
-          make CC="${{ matrix.target }}-gcc" CFLAGS="-std=c99 -Wall -Wextra -Wvla -pthread -O3 -flto -fno-strict-aliasing -ffunction-sections -fdata-sections -DNDEBUG ${{ matrix.cflags }}"
+          # Fix ownership
+          sudo chown -R $USER:$USER .
+          
           mv ipt2socks ${{ matrix.name }}
           sha256sum ${{ matrix.name }} > ${{ matrix.name }}.sha256
 
@@ -99,3 +93,4 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: artifacts/*
+
