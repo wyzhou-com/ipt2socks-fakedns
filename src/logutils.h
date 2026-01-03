@@ -4,6 +4,10 @@
 #define _GNU_SOURCE
 #include <stdio.h>
 #include <time.h>
+#include <stdbool.h>
+
+extern bool g_verbose;
+#define IF_VERBOSE if (g_verbose)
 
 #define LOGINF(fmt, ...)                                                     \
     do {                                                                     \

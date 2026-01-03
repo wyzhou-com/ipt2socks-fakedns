@@ -26,7 +26,7 @@ static uint32_t g_fakeip_mask_host = 0; /* Host byte order */
 static uint32_t g_pool_size = 0;
 static uint32_t g_pool_used = 0;
 
-static const uint32_t FAKEDNS_TTL = 600;
+static const uint32_t FAKEDNS_TTL = 43200; // 12 hours
 
 // Pool usage warning thresholds
 #define FAKEDNS_POOL_WARN_THRESHOLD   0.80f  // 80% usage warning
@@ -187,7 +187,25 @@ uint32_t fakedns_lookup_domain(const char *domain) {
                     ip_net & 0xFF, (ip_net >> 8) & 0xFF, (ip_net >> 16) & 0xFF, (ip_net >> 24) & 0xFF); */
                 return ip_net;
             } else {
-                // Collision, linear probe
+                // Collision
+                /* Strategy A: Overwrite if expired */
+                if (entry->expire < now) {
+                     IF_VERBOSE {
+                         LOGINF("[fakedns] overwrite expired entry: %s -> %s (IP: %u.%u.%u.%u)",
+                                entry->domain, domain,
+                                ip_net & 0xFF, (ip_net >> 8) & 0xFF, (ip_net >> 16) & 0xFF, (ip_net >> 24) & 0xFF);
+                     }
+                     
+                     // Reset entry for new domain
+                     strncpy(entry->domain, domain, sizeof(entry->domain) - 1);
+                     entry->domain[sizeof(entry->domain) - 1] = '\0';
+                     entry->expire = now + FAKEDNS_TTL;
+                     
+                     pthread_rwlock_unlock(&g_fakedns_rwlock);
+                     return ip_net;
+                }
+                
+                // Still valid, linear probe
                 offset = (offset + 1) % g_pool_size;
             }
         }

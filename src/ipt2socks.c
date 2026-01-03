@@ -35,7 +35,6 @@
   #define splice(fdin, offin, fdout, offout, len, flags) syscall(__NR_splice, fdin, offin, fdout, offout, len, flags)
 #endif
 
-#define IF_VERBOSE if (g_verbose)
 
 #define TCP_SPLICE_MAXLEN 65535 /* uint16_t: 0~65535 */
 
@@ -88,7 +87,7 @@ static void udp_socks5_context_timeout_cb(evloop_t *evloop, evtimer_t *watcher, 
 static void udp_tproxy_context_timeout_cb(evloop_t *evloop, evtimer_t *watcher, int revents);
 static void udp_dns_recv_cb(evloop_t *evloop, evio_t *watcher, int revents);
 
-static bool     g_verbose  = false;
+bool     g_verbose  = false;
 static uint16_t g_options  = OPT_ENABLE_TCP | OPT_ENABLE_UDP | OPT_ENABLE_IPV4 | OPT_ENABLE_IPV6;
 static uint8_t  g_nthreads = 1;
 
@@ -1505,7 +1504,7 @@ static void udp_socks5_recv_udpmessage_cb(evloop_t *evloop, evio_t *udp_watcher,
         return;
     }
 
-    /* For IP responses: use saved original destination (FakeIP/真实IP) */
+    /* For IP responses: use saved original destination (FakeIP/RealIP) */
     ip_port_t fromipport = socks5ctx->orig_dstaddr;
     bool dest_isipv4 = socks5ctx->dest_is_ipv4;
 
