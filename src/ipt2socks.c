@@ -105,6 +105,7 @@ static uint8_t g_tcp_syncnt_max = 0; // 0: use default syncnt
 
 static uint16_t         g_udp_idletimeout_sec                   = 60;
 static udp_socks5ctx_t *g_udp_socks5ctx_table                   = NULL;
+static udp_socks5ctx_t *g_udp_fork_table                        = NULL; // Fork table for collision handling
 static udp_tproxyctx_t *g_udp_tproxyctx_table                   = NULL;
 static char             g_udp_dgram_buffer[UDP_DATAGRAM_MAXSIZ] = {0};
 
@@ -966,7 +967,8 @@ static void udp_tproxy_recvmsg_cb(evloop_t *evloop, evio_t *tprecv_watcher, int 
         LOGINF("[udp_tproxy_recvmsg_cb] recv from %s#%hu, nrecv:%zd", ipstr, portno, nrecv);
     }
 
-    ip_port_t key_ipport = {.ip = {0}, .port = 0};
+    ip_port_t key_ipport;
+    memset(&key_ipport, 0, sizeof(key_ipport));
     if (isipv4) {
         key_ipport.ip.ip4 = ((skaddr4_t *)&skaddr)->sin_addr.s_addr;
         key_ipport.port = ((skaddr4_t *)&skaddr)->sin_port;
@@ -1042,7 +1044,40 @@ static void udp_tproxy_recvmsg_cb(evloop_t *evloop, evio_t *tprecv_watcher, int 
         }
     }
 
-    udp_socks5ctx_t *context = udp_socks5ctx_get(&g_udp_socks5ctx_table, &key_ipport);
+    udp_socks5ctx_t *context = NULL;
+    bool force_fork = false;
+    uint32_t target_ip = 0;
+    
+    if (isipv4) target_ip = ((skaddr4_t *)&skaddr)->sin_addr.s_addr;
+
+    if (fake_domain && (g_options & OPT_ENABLE_FAKEDNS) && isipv4) {
+        udp_fork_key_t fork_key;
+        memset(&fork_key, 0, sizeof(fork_key));
+        fork_key.client_ipport = key_ipport;
+        fork_key.target_ip = target_ip;
+        
+        /* 1. Check Fork Table first (Symmetric Path) */
+        context = udp_socks5ctx_fork_get(&g_udp_fork_table, &fork_key);
+        
+        if (!context) {
+            /* 2. Check Main Table (Cone Path) */
+            udp_socks5ctx_t *main_ctx = udp_socks5ctx_get(&g_udp_socks5ctx_table, &key_ipport);
+            if (main_ctx) {
+                /* Check if Target Matches */
+                if (main_ctx->dest_is_ipv4 && main_ctx->orig_dstaddr.ip.ip4 == target_ip) {
+                    /* Match! Safe to reuse Main Context */
+                    context = main_ctx;
+                } else {
+                    /* Collision detected! Client reusing port for diff Target. Force Fork. */
+                    force_fork = true;
+                    IF_VERBOSE LOGINF("[udp_tproxy_recvmsg_cb] collision detected for %s, forcing fork", fake_domain);
+                }
+            }
+        }
+    } else {
+        context = udp_socks5ctx_get(&g_udp_socks5ctx_table, &key_ipport);
+    }
+
     if (!context) {
         int tcp_sockfd = new_tcp_connect_sockfd(g_server_skaddr.sin6_family, g_tcp_syncnt_max);
         const void *tfo_data = (g_options & OPT_ENABLE_TFO_CONNECT) ? &g_socks5_auth_request : NULL;
@@ -1096,7 +1131,18 @@ static void udp_tproxy_recvmsg_cb(evloop_t *evloop, evio_t *tprecv_watcher, int 
         ev_timer_init(timer, udp_socks5_context_timeout_cb, 0, g_udp_idletimeout_sec);
         timer->data = (void *)sizeof(socks5_ipv4resp_t); // response_length
 
-        udp_socks5ctx_t *del_context = udp_socks5ctx_add(&g_udp_socks5ctx_table, context);
+        udp_socks5ctx_t *del_context = NULL;
+        if (force_fork) {
+            context->is_forked = true;
+            memset(&context->fork_key, 0, sizeof(context->fork_key));
+            context->fork_key.client_ipport = key_ipport;
+            context->fork_key.target_ip = target_ip;
+            del_context = udp_socks5ctx_fork_add(&g_udp_fork_table, context);
+        } else {
+            context->is_forked = false;
+            del_context = udp_socks5ctx_add(&g_udp_socks5ctx_table, context);
+        }
+
         if (del_context) ev_invoke(evloop, &del_context->idle_timer, EV_CUSTOM);
         return;
     }
@@ -1358,7 +1404,11 @@ static void udp_socks5_recv_proxyresp_cb(evloop_t *evloop, evio_t *tcp_watcher, 
     watcher->data = NULL; /* udp_watcher->data */
 
     ev_timer_again(evloop, &context->idle_timer);
-    udp_socks5ctx_use(&g_udp_socks5ctx_table, context);
+    if (context->is_forked) {
+        udp_socks5ctx_use(&g_udp_fork_table, context);
+    } else {
+        udp_socks5ctx_use(&g_udp_socks5ctx_table, context);
+    }
 }
 
 static void udp_socks5_recv_tcpmessage_cb(evloop_t *evloop, evio_t *tcp_watcher, int revents __attribute__((unused))) {
@@ -1430,7 +1480,11 @@ static void udp_socks5_recv_udpmessage_cb(evloop_t *evloop, evio_t *udp_watcher,
     }
 
     udp_socks5ctx_t *socks5ctx = (void *)udp_watcher - offsetof(udp_socks5ctx_t, udp_watcher);
-    udp_socks5ctx_use(&g_udp_socks5ctx_table, socks5ctx);
+    if (socks5ctx->is_forked) {
+        udp_socks5ctx_use(&g_udp_fork_table, socks5ctx);
+    } else {
+        udp_socks5ctx_use(&g_udp_socks5ctx_table, socks5ctx);
+    }
     ev_timer_again(evloop, &socks5ctx->idle_timer);
 
     /* For domain responses, we don't parse fromipport - we send back to the original requester */
@@ -1568,7 +1622,11 @@ static void udp_socks5_context_timeout_cb(evloop_t *evloop, evtimer_t *idle_time
     IF_VERBOSE LOGINF("[udp_socks5_context_timeout_cb] context will be released, reason: %s", revents & EV_CUSTOM ? "manual" : "timeout");
 
     udp_socks5ctx_t *context = (void *)idle_timer - offsetof(udp_socks5ctx_t, idle_timer);
-    udp_socks5ctx_del(&g_udp_socks5ctx_table, context);
+    if (context->is_forked) {
+        udp_socks5ctx_del(&g_udp_fork_table, context);
+    } else {
+        udp_socks5ctx_del(&g_udp_socks5ctx_table, context);
+    }
 
     ev_timer_stop(evloop, idle_timer);
 
