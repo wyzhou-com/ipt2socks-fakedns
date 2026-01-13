@@ -38,6 +38,20 @@
 
 #define TCP_SPLICE_MAXLEN 65535 /* uint16_t: 0~65535 */
 
+typedef struct udp_packet_node {
+    struct udp_packet_node *next;
+    size_t len;
+    uint8_t data[];
+} udp_packet_node_t;
+
+typedef struct {
+    udp_packet_node_t *head;
+    udp_packet_node_t *tail;
+    size_t count;
+} udp_packet_queue_t;
+
+#define UDP_QUEUE_MAX_DEPTH 64
+
 #define IPT2SOCKS_VERSION "ipt2socks v1.1.5 <https://github.com/zfl9/ipt2socks>"
 
 enum {
@@ -1012,13 +1026,11 @@ static void udp_tproxy_recvmsg_cb(evloop_t *evloop, evio_t *tprecv_watcher, int 
         /* Adjust DNS payload position for domain header size difference */
         if (domain_headerlen > headerlen) {
             /* Move DNS payload forward by the difference */
-            size_t move_offset = domain_headerlen - headerlen;
             memmove((uint8_t *)g_udp_dgram_buffer + domain_headerlen,
                    (uint8_t *)g_udp_dgram_buffer + headerlen,
                    nrecv);
         } else if (domain_headerlen < headerlen) {
             /* Move DNS payload backward (unlikely but handle it) */
-            size_t move_offset = headerlen - domain_headerlen;
             memmove((uint8_t *)g_udp_dgram_buffer + domain_headerlen,
                    (uint8_t *)g_udp_dgram_buffer + headerlen,
                    nrecv);
@@ -1123,9 +1135,16 @@ static void udp_tproxy_recvmsg_cb(evloop_t *evloop, evio_t *tprecv_watcher, int 
         *(uint16_t *)context->tcp_watcher.data = tfo_nsend; /* nsend or nrecv */
 
         /* tunnel not ready if udp_watcher->data != NULL */
-        context->udp_watcher.data = malloc(2 + headerlen + nrecv);
-        *(uint16_t *)context->udp_watcher.data = headerlen + nrecv;
-        memcpy(context->udp_watcher.data + 2, g_udp_dgram_buffer, headerlen + nrecv);
+        udp_packet_node_t *node = malloc(sizeof(udp_packet_node_t) + headerlen + nrecv);
+        node->next = NULL;
+        node->len = headerlen + nrecv;
+        memcpy(node->data, g_udp_dgram_buffer, headerlen + nrecv);
+        
+        udp_packet_queue_t *queue = malloc(sizeof(udp_packet_queue_t));
+        queue->head = node;
+        queue->tail = node;
+        queue->count = 1;
+        context->udp_watcher.data = queue;
 
         evtimer_t *timer = &context->idle_timer;
         ev_timer_init(timer, udp_socks5_context_timeout_cb, 0, g_udp_idletimeout_sec);
@@ -1149,7 +1168,29 @@ static void udp_tproxy_recvmsg_cb(evloop_t *evloop, evio_t *tprecv_watcher, int 
     
     /* Tunnel not ready if udp_watcher.data != NULL */
     if (context->udp_watcher.data) {
-        IF_VERBOSE LOGINF("[udp_tproxy_recvmsg_cb] tunnel is not ready, discard this msg");
+        udp_packet_queue_t *queue = context->udp_watcher.data;
+        
+        if (queue->count >= UDP_QUEUE_MAX_DEPTH) {
+            IF_VERBOSE LOGWAR("[udp_tproxy_recvmsg_cb] packet queue full (%zu), dropping this msg", queue->count);
+            return;
+        }
+
+        IF_VERBOSE LOGINF("[udp_tproxy_recvmsg_cb] tunnel is not ready, buffering this msg (queue: %zu)", queue->count);
+        
+        udp_packet_node_t *node = malloc(sizeof(udp_packet_node_t) + headerlen + nrecv);
+        node->next = NULL;
+        node->len = headerlen + nrecv;
+        memcpy(node->data, g_udp_dgram_buffer, headerlen + nrecv);
+
+        /* Append to the end of the list (O(1)) */
+        if (queue->tail) {
+            queue->tail->next = node;
+            queue->tail = node;
+        } else {
+            queue->head = node;
+            queue->tail = node;
+        }
+        queue->count++;
         return;
     }
 
@@ -1261,7 +1302,7 @@ static void udp_socks5_recv_authresp_cb(evloop_t *evloop, evio_t *tcp_watcher, i
         datalen = g_socks5_usrpwd_requestlen;
     } else {
         udp_socks5ctx_t *context = get_udpsk5ctx_by_tcp(tcp_watcher);
-        bool isipv4 = ((socks5_udp4msg_t *)(context->udp_watcher.data + 2))->addrtype == SOCKS5_ADDRTYPE_IPV4;
+        bool isipv4 = ((socks5_udp4msg_t *)((udp_packet_queue_t *)context->udp_watcher.data)->head->data)->addrtype == SOCKS5_ADDRTYPE_IPV4;
         data = isipv4 ? (void *)&G_SOCKS5_UDP4_REQUEST : (void *)&G_SOCKS5_UDP6_REQUEST;
         datalen = isipv4 ? sizeof(socks5_ipv4req_t) : sizeof(socks5_ipv6req_t);
     }
@@ -1293,7 +1334,7 @@ static void udp_socks5_recv_usrpwdresp_cb(evloop_t *evloop, evio_t *tcp_watcher,
         return;
     }
     udp_socks5ctx_t *context = get_udpsk5ctx_by_tcp(tcp_watcher);
-    bool isipv4 = ((socks5_udp4msg_t *)(context->udp_watcher.data + 2))->addrtype == SOCKS5_ADDRTYPE_IPV4;
+    bool isipv4 = ((socks5_udp4msg_t *)((udp_packet_queue_t *)context->udp_watcher.data)->head->data)->addrtype == SOCKS5_ADDRTYPE_IPV4;
     const void *data = isipv4 ? (void *)&G_SOCKS5_UDP4_REQUEST : (void *)&G_SOCKS5_UDP6_REQUEST;
     uint16_t datalen = isipv4 ? sizeof(socks5_ipv4req_t) : sizeof(socks5_ipv6req_t);
     int ret = udp_socks5_send_request("udp_socks5_recv_usrpwdresp_cb", evloop, tcp_watcher, data, datalen);
@@ -1308,7 +1349,7 @@ static void udp_socks5_recv_usrpwdresp_cb(evloop_t *evloop, evio_t *tcp_watcher,
 
 static void udp_socks5_send_proxyreq_cb(evloop_t *evloop, evio_t *tcp_watcher, int revents __attribute__((unused))) {
     udp_socks5ctx_t *context = get_udpsk5ctx_by_tcp(tcp_watcher);
-    bool isipv4 = ((socks5_udp4msg_t *)(context->udp_watcher.data + 2))->addrtype == SOCKS5_ADDRTYPE_IPV4;
+    bool isipv4 = ((socks5_udp4msg_t *)((udp_packet_queue_t *)context->udp_watcher.data)->head->data)->addrtype == SOCKS5_ADDRTYPE_IPV4;
     const void *request = isipv4 ? (void *)&G_SOCKS5_UDP4_REQUEST : (void *)&G_SOCKS5_UDP6_REQUEST;
     uint16_t requestlen = isipv4 ? sizeof(socks5_ipv4req_t) : sizeof(socks5_ipv6req_t);
     if (udp_socks5_send_request("udp_socks5_send_proxyreq_cb", evloop, tcp_watcher, request, requestlen) != 1) {
@@ -1364,34 +1405,44 @@ static void udp_socks5_recv_proxyresp_cb(evloop_t *evloop, evio_t *tcp_watcher, 
         return;
     }
 
-    ssize_t nsend = send(udp_sockfd, context->udp_watcher.data + 2, *(uint16_t *)context->udp_watcher.data, 0);
-    if (nsend < 0 || g_verbose) {
-        char ipstr[IP6STRLEN]; portno_t portno;
-        uint8_t addrtype = ((socks5_udp4msg_t *)(context->udp_watcher.data + 2))->addrtype;
-        
-        if (addrtype == SOCKS5_ADDRTYPE_IPV4) {
-            socks5_udp4msg_t *udp4msg = context->udp_watcher.data + 2;
-            inet_ntop(AF_INET, &udp4msg->ipaddr4, ipstr, IP6STRLEN);
-            portno = ntohs(udp4msg->portnum);
-        } else if (addrtype == SOCKS5_ADDRTYPE_DOMAIN) {
-            /* Domain format: extract domain and port for logging */
-            uint8_t *msg = context->udp_watcher.data + 2;
-            uint8_t domain_len = msg[4];
-            memcpy(ipstr, msg + 5, domain_len);
-            ipstr[domain_len] = '\0';
-            memcpy(&portno, msg + 5 + domain_len, 2);
-            portno = ntohs(portno);
-        } else {
-            socks5_udp6msg_t *udp6msg = context->udp_watcher.data + 2;
-            inet_ntop(AF_INET6, &udp6msg->ipaddr6, ipstr, IP6STRLEN);
-            portno = ntohs(udp6msg->portnum);
+    udp_packet_queue_t *queue = context->udp_watcher.data;
+    udp_packet_node_t *curr = queue->head;
+    while (curr) {
+        ssize_t nsend = send(udp_sockfd, curr->data, curr->len, 0);
+        if (nsend < 0 || g_verbose) {
+            char ipstr[IP6STRLEN]; portno_t portno;
+            uint8_t addrtype = ((socks5_udp4msg_t *)curr->data)->addrtype;
+            
+            if (addrtype == SOCKS5_ADDRTYPE_IPV4) {
+                socks5_udp4msg_t *udp4msg = (void *)curr->data;
+                inet_ntop(AF_INET, &udp4msg->ipaddr4, ipstr, IP6STRLEN);
+                portno = ntohs(udp4msg->portnum);
+            } else if (addrtype == SOCKS5_ADDRTYPE_DOMAIN) {
+                /* Domain format: extract domain and port for logging */
+                uint8_t *msg = curr->data;
+                uint8_t domain_len = msg[4];
+                memcpy(ipstr, msg + 5, domain_len);
+                ipstr[domain_len] = '\0';
+                memcpy(&portno, msg + 5 + domain_len, 2);
+                portno = ntohs(portno);
+            } else {
+                socks5_udp6msg_t *udp6msg = (void *)curr->data;
+                inet_ntop(AF_INET6, &udp6msg->ipaddr6, ipstr, IP6STRLEN);
+                portno = ntohs(udp6msg->portnum);
+            }
+            if (nsend < 0) {
+                LOGERR("[udp_socks5_recv_proxyresp_cb] send to %s#%hu: %s", ipstr, portno, strerror(errno));
+            } else {
+                LOGINF("[udp_socks5_recv_proxyresp_cb] send to %s#%hu, nsend:%zd", ipstr, portno, nsend);
+            }
         }
-        if (nsend < 0) {
-            LOGERR("[udp_socks5_recv_proxyresp_cb] send to %s#%hu: %s", ipstr, portno, strerror(errno));
-        } else {
-            LOGINF("[udp_socks5_recv_proxyresp_cb] send to %s#%hu, nsend:%zd", ipstr, portno, nsend);
-        }
+        udp_packet_node_t *next = curr->next;
+        free(curr);
+        curr = next;
     }
+    
+    free(context->udp_watcher.data);
+    context->udp_watcher.data = NULL;
 
     ev_set_cb(tcp_watcher, udp_socks5_recv_tcpmessage_cb);
     free(tcp_watcher->data);
@@ -1400,8 +1451,6 @@ static void udp_socks5_recv_proxyresp_cb(evloop_t *evloop, evio_t *tcp_watcher, 
     evio_t *watcher = &context->udp_watcher;
     ev_io_init(watcher, udp_socks5_recv_udpmessage_cb, udp_sockfd, EV_READ);
     ev_io_start(evloop, watcher);
-    free(watcher->data); /* udp_watcher->data */
-    watcher->data = NULL; /* udp_watcher->data */
 
     ev_timer_again(evloop, &context->idle_timer);
     if (context->is_forked) {
@@ -1424,6 +1473,7 @@ static void udp_socks5_recv_tcpmessage_cb(evloop_t *evloop, evio_t *tcp_watcher,
         udp_socks5ctx_release(evloop, get_udpsk5ctx_by_tcp(tcp_watcher));
     }
 }
+
 
 static void udp_socks5_recv_udpmessage_cb(evloop_t *evloop, evio_t *udp_watcher, int revents __attribute__((unused))) {
     ssize_t nrecv = recv(udp_watcher->fd, g_udp_dgram_buffer, UDP_DATAGRAM_MAXSIZ, 0);
@@ -1635,7 +1685,15 @@ static void udp_socks5_context_timeout_cb(evloop_t *evloop, evtimer_t *idle_time
     free(context->tcp_watcher.data);
 
     if (context->udp_watcher.data) {
-        free(context->udp_watcher.data);
+        udp_packet_queue_t *queue = context->udp_watcher.data;
+        udp_packet_node_t *curr = queue->head;
+        while (curr) {
+            udp_packet_node_t *next = curr->next;
+            free(curr);
+            curr = next;
+        }
+        free(queue);
+        context->udp_watcher.data = NULL;
     } else {
         ev_io_stop(evloop, &context->udp_watcher);
         close(context->udp_watcher.fd);
