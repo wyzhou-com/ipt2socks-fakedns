@@ -5,17 +5,34 @@
 #include <stdio.h>
 #include <time.h>
 #include <stdbool.h>
+#include <stdatomic.h>
 
 extern bool g_verbose;
 #define IF_VERBOSE if (g_verbose)
 
-#define LOG_ALWAYS_INF(fmt, ...)                                             \
-    do {                                                                     \
-        struct tm *tm = localtime_r(&(time_t){time(NULL)}, &(struct tm){0}); \
-        printf("\e[1;32m%04d-%02d-%02d %02d:%02d:%02d INF:\e[0m " fmt "\n",  \
-                tm->tm_year + 1900, tm->tm_mon + 1, tm->tm_mday,             \
-                tm->tm_hour,        tm->tm_min,     tm->tm_sec,              \
-                ##__VA_ARGS__);                                              \
+/* Cached time string (thread-safe) */
+extern char g_log_time_str[20];  /* "YYYY-MM-DD HH:MM:SS" */
+extern atomic_long g_log_time_epoch;
+
+static inline void update_log_time(void) {
+    time_t now = time(NULL);
+    /* Only update when seconds change (avoid repeated conversion) */
+    if (now != atomic_load(&g_log_time_epoch)) {
+        atomic_store(&g_log_time_epoch, now);
+        struct tm tm;
+        localtime_r(&now, &tm);
+        snprintf(g_log_time_str, sizeof(g_log_time_str),
+                 "%04d-%02d-%02d %02d:%02d:%02d",
+                 tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday,
+                 tm.tm_hour, tm.tm_min, tm.tm_sec);
+    }
+}
+
+#define LOG_ALWAYS_INF(fmt, ...)                                 \
+    do {                                                         \
+        update_log_time();                                       \
+        printf("\e[1;32m%s INF:\e[0m " fmt "\n",                 \
+               g_log_time_str, ##__VA_ARGS__);                   \
     } while (0)
 
 #define LOGINF(fmt, ...)           \
@@ -25,22 +42,18 @@ extern bool g_verbose;
         }                          \
     } while (0)
 
-#define LOGERR(fmt, ...)                                                     \
-    do {                                                                     \
-        struct tm *tm = localtime_r(&(time_t){time(NULL)}, &(struct tm){0}); \
-        printf("\e[1;35m%04d-%02d-%02d %02d:%02d:%02d ERR:\e[0m " fmt "\n",  \
-                tm->tm_year + 1900, tm->tm_mon + 1, tm->tm_mday,             \
-                tm->tm_hour,        tm->tm_min,     tm->tm_sec,              \
-                ##__VA_ARGS__);                                              \
+#define LOGERR(fmt, ...)                                         \
+    do {                                                         \
+        update_log_time();                                       \
+        printf("\e[1;35m%s ERR:\e[0m " fmt "\n",                 \
+               g_log_time_str, ##__VA_ARGS__);                   \
     } while (0)
 
-#define LOGWAR(fmt, ...)                                                     \
-    do {                                                                     \
-        struct tm *tm = localtime_r(&(time_t){time(NULL)}, &(struct tm){0}); \
-        printf("\e[1;33m%04d-%02d-%02d %02d:%02d:%02d WAR:\e[0m " fmt "\n",  \
-                tm->tm_year + 1900, tm->tm_mon + 1, tm->tm_mday,             \
-                tm->tm_hour,        tm->tm_min,     tm->tm_sec,              \
-                ##__VA_ARGS__);                                              \
+#define LOGWAR(fmt, ...)                                         \
+    do {                                                         \
+        update_log_time();                                       \
+        printf("\e[1;33m%s WAR:\e[0m " fmt "\n",                 \
+               g_log_time_str, ##__VA_ARGS__);                   \
     } while (0)
 
 #endif

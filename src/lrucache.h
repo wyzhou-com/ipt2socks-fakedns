@@ -1,7 +1,6 @@
 #ifndef IPT2SOCKS_LRUCACHE_H
 #define IPT2SOCKS_LRUCACHE_H
 
-#define _GNU_SOURCE
 #include "uthash.h"
 #include "netutils.h"
 #include "../libev/ev.h"

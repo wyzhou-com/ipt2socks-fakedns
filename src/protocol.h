@@ -1,7 +1,6 @@
 #ifndef IPT2SOCKS_PROTOCOL_H
 #define IPT2SOCKS_PROTOCOL_H
 
-#define _GNU_SOURCE
 #include "netutils.h"
 
 /* socks5 protocol version number */

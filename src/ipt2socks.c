@@ -281,13 +281,15 @@ static void parse_command_args(int argc, char* argv[]) {
                     goto PRINT_HELP_AND_EXIT;
                 }
                 break;
-            case 'c':
-                if (strtoul(optarg, NULL, 10) == 0) {
+            case 'c': {
+                uint16_t cache_size = strtoul(optarg, NULL, 10);
+                if (cache_size == 0) {
                     printf("[parse_command_args] invalid maxsize of udp lrucache: %s\n", optarg);
                     goto PRINT_HELP_AND_EXIT;
                 }
-                lrucache_set_maxsize(strtoul(optarg, NULL, 10));
+                lrucache_set_maxsize(cache_size);
                 break;
+            }
             case 'o':
                 g_udp_idletimeout_sec = strtoul(optarg, NULL, 10);
                 if (g_udp_idletimeout_sec == 0) {
@@ -364,11 +366,22 @@ static void parse_command_args(int argc, char* argv[]) {
                     printf("[parse_command_args] fakedns address max length is 15: %s\n", optarg);
                     goto PRINT_HELP_AND_EXIT;
                 }
+                if (get_ipstr_family(optarg) != AF_INET) {
+                    printf("[parse_command_args] invalid fakedns ipv4 address: %s\n", optarg);
+                    goto PRINT_HELP_AND_EXIT;
+                }
                 strcpy(g_fakedns_ipstr, optarg);
                 break;
-            case 1003:
-                g_fakedns_portno = strtoul(optarg, NULL, 10);
+            case 1003: {
+                char *endptr;
+                unsigned long port = strtoul(optarg, &endptr, 10);
+                if (*endptr != '\0' || port == 0 || port > 65535) {
+                    printf("[parse_command_args] invalid fakedns port number: %s\n", optarg);
+                    goto PRINT_HELP_AND_EXIT;
+                }
+                g_fakedns_portno = (portno_t)port;
                 break;
+            }
             case 1004:
                 strncpy(g_fakedns_cidr, optarg, sizeof(g_fakedns_cidr) - 1);
                 g_fakedns_cidr[sizeof(g_fakedns_cidr) - 1] = '\0';
@@ -416,18 +429,8 @@ PRINT_HELP_AND_EXIT:
     exit(1);
 }
 
-static void on_signal_exit(int sig) {
-    LOG_ALWAYS_INF("[on_signal_exit] caught signal %d, exiting...", sig);
-    if ((g_options & OPT_ENABLE_FAKEDNS) && g_fakedns_cache_path[0]) {
-        fakedns_save(g_fakedns_cache_path);
-    }
-    exit(0);
-}
-
 int main(int argc, char* argv[]) {
     signal(SIGPIPE, SIG_IGN);
-    // signal(SIGINT, on_signal_exit);  <-- Removed
-    // signal(SIGTERM, on_signal_exit); <-- Removed
 
     sigset_t mask;
     sigemptyset(&mask);
@@ -480,8 +483,6 @@ int main(int argc, char* argv[]) {
 }
 
 #include <sys/signalfd.h>
-
-// ...
 
 static void on_signal_read(evloop_t *loop, evio_t *watcher, int revents __attribute__((unused))) {
     struct signalfd_siginfo fdsi;
@@ -936,7 +937,7 @@ DO_WRITE:
         remain_length -= (size_t)nsend;
         *(self_is_client ? &context->socks5_length : &context->client_length) = remain_length;
 
-        if (remain_length <= 0) {
+        if (remain_length == 0) {
             ev_io_stop(evloop, self_watcher);
             ev_io_modify(self_watcher, self_watcher->events & ~EV_WRITE);
             if (self_watcher->events & EV_READ) ev_io_start(evloop, self_watcher);
@@ -1716,6 +1717,10 @@ static void udp_dns_recv_cb(evloop_t *evloop, evio_t *watcher, int revents) {
     size_t nresp = fakedns_process_query((uint8_t*)g_udp_dgram_buffer, nrecv, (uint8_t*)g_udp_dgram_buffer, UDP_DATAGRAM_MAXSIZ);
     
     if (nresp > 0) {
-        sendto(watcher->fd, g_udp_dgram_buffer, nresp, 0, (struct sockaddr *)&addr, addrlen);
+        if (sendto(watcher->fd, g_udp_dgram_buffer, nresp, 0, (struct sockaddr *)&addr, addrlen) < 0) {
+            if (errno != EAGAIN && errno != EWOULDBLOCK) {
+                LOGERR("[udp_dns_recv_cb] sendto: %s", strerror(errno));
+            }
+        }
     }
 }

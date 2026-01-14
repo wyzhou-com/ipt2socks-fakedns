@@ -25,6 +25,7 @@ static uint32_t g_fakeip_net_host = 0; /* Host byte order */
 static uint32_t g_fakeip_mask_host = 0; /* Host byte order */
 static uint32_t g_pool_size = 0;
 static uint32_t g_pool_used = 0;
+static uint32_t g_last_warn_used = 0;  /* for warning log throttling */
 static char g_cidr_str[64] = {0};
 
 static const uint32_t FAKEDNS_TTL = 43200; // 12 hours
@@ -64,7 +65,8 @@ void fakedns_init(const char *cidr_str) {
         exit(1);
     }
     *slash = '\0';
-    int prefix_len = atoi(slash + 1);
+    char *endptr;
+    long prefix_len = strtol(slash + 1, &endptr, 10);
 
     struct in_addr addr;
     if (inet_pton(AF_INET, ip_str, &addr) != 1) {
@@ -72,8 +74,8 @@ void fakedns_init(const char *cidr_str) {
         exit(1);
     }
 
-    if (prefix_len < 0 || prefix_len > 32) {
-        LOGERR("[fakedns_init] invalid prefix length: %d", prefix_len);
+    if (*endptr != '\0' || prefix_len < 0 || prefix_len > 32) {
+        LOGERR("[fakedns_init] invalid prefix length: %s", slash + 1);
         exit(1);
     }
 
@@ -84,7 +86,7 @@ void fakedns_init(const char *cidr_str) {
     g_fakeip_mask_host = mask_host;
     g_pool_size = (prefix_len == 32) ? 1 : (1U << (32 - prefix_len));
 
-    LOG_ALWAYS_INF("[fakedns_init] IP range: %s/%d", ip_str, prefix_len);
+    LOG_ALWAYS_INF("[fakedns_init] IP range: %s/%ld", ip_str, prefix_len);
     LOG_ALWAYS_INF("[fakedns_init] Pool size: %u addresses (%.1f KB memory)", 
            g_pool_size, (float)(g_pool_size * sizeof(fakedns_entry_t)) / 1024.0f);
     LOG_ALWAYS_INF("[fakedns_init] Warning threshold: %.0f%% (%u entries)", 
@@ -159,6 +161,11 @@ uint32_t fakedns_lookup_domain(const char *domain) {
 
             // Found empty slot, insert new entry
             entry = malloc(sizeof(fakedns_entry_t));
+            if (!entry) {
+                pthread_rwlock_unlock(&g_fakedns_rwlock);
+                LOGERR("[fakedns_lookup_domain] malloc failed for domain: %s", domain);
+                return 0;
+            }
             entry->ip = ip_net;
             strncpy(entry->domain, domain, sizeof(entry->domain) - 1);
             entry->domain[sizeof(entry->domain) - 1] = '\0';
@@ -172,12 +179,11 @@ uint32_t fakedns_lookup_domain(const char *domain) {
                 LOGWAR("[fakedns] CRITICAL: pool usage %.1f%% (%u/%u), consider expanding pool or restarting", 
                        usage * 100.0f, g_pool_used, g_pool_size);
             } else if (usage >= FAKEDNS_POOL_WARN_THRESHOLD) {
-                static uint32_t last_warn_used = 0;
                 // Only warn every 5% increase to avoid spam
-                if (g_pool_used - last_warn_used >= g_pool_size / 20) {
+                if (g_pool_used - g_last_warn_used >= g_pool_size / 20) {
                     LOGWAR("[fakedns] WARNING: pool usage %.1f%% (%u/%u)", 
                            usage * 100.0f, g_pool_used, g_pool_size);
-                    last_warn_used = g_pool_used;
+                    g_last_warn_used = g_pool_used;
                 }
             }
             
@@ -372,22 +378,35 @@ void fakedns_save(const char *path) {
     }
 
     // Write Header
-    fwrite(&FAKEDNS_MAGIC, 4, 1, fp);
-    fwrite(&FAKEDNS_VERSION, 4, 1, fp);
-    fwrite(&count, 4, 1, fp);
+    if (fwrite(&FAKEDNS_MAGIC, 4, 1, fp) != 1 ||
+        fwrite(&FAKEDNS_VERSION, 4, 1, fp) != 1 ||
+        fwrite(&count, 4, 1, fp) != 1) {
+        LOGERR("[fakedns_save] failed to write header to %s", path);
+        pthread_rwlock_unlock(&g_fakedns_rwlock);
+        fclose(fp);
+        return;
+    }
 
     // Version 2: Write CIDR
     uint16_t cidr_len = strlen(g_cidr_str);
-    fwrite(&cidr_len, 2, 1, fp);
-    fwrite(g_cidr_str, 1, cidr_len, fp);
+    if (fwrite(&cidr_len, 2, 1, fp) != 1 ||
+        fwrite(g_cidr_str, 1, cidr_len, fp) != cidr_len) {
+        LOGERR("[fakedns_save] failed to write CIDR to %s", path);
+        pthread_rwlock_unlock(&g_fakedns_rwlock);
+        fclose(fp);
+        return;
+    }
 
     // Write Entries
     HASH_ITER(hh, g_fakedns_table, entry, tmp) {
         uint16_t dlen = strlen(entry->domain);
-        fwrite(&entry->ip, 4, 1, fp);
-        fwrite(&entry->expire, 8, 1, fp);
-        fwrite(&dlen, 2, 1, fp);
-        fwrite(entry->domain, 1, dlen, fp);
+        if (fwrite(&entry->ip, 4, 1, fp) != 1 ||
+            fwrite(&entry->expire, 8, 1, fp) != 1 ||
+            fwrite(&dlen, 2, 1, fp) != 1 ||
+            fwrite(entry->domain, 1, dlen, fp) != dlen) {
+            LOGERR("[fakedns_save] failed to write entry to %s", path);
+            break;
+        }
     }
 
     pthread_rwlock_unlock(&g_fakedns_rwlock);
@@ -496,6 +515,10 @@ void fakedns_load(const char *path) {
          HASH_FIND_INT(g_fakedns_table, &ip, entry);
          if (!entry) {
              entry = malloc(sizeof(fakedns_entry_t));
+             if (!entry) {
+                 LOGERR("[fakedns_load] malloc failed for domain: %s", domain);
+                 continue;
+             }
              entry->ip = ip;
              strncpy(entry->domain, domain, sizeof(entry->domain));
              entry->expire = expire;
