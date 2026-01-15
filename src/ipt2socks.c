@@ -4,6 +4,7 @@
 #include "netutils.h"
 #include "protocol.h"
 #include "fakedns.h"
+#include "mempool.h"
 #include "../libev/ev.h"
 #include <stddef.h>
 #include <stdint.h>
@@ -53,6 +54,10 @@ typedef struct {
 
 #define UDP_QUEUE_MAX_DEPTH 64
 #define UDP_BATCH_SIZE      64
+
+/* Memory pool configuration for UDP packets */
+#define MEMPOOL_BLOCK_SIZE    2048   /* 2KB blocks, covers 99% UDP traffic */
+#define MEMPOOL_INITIAL_SIZE  256    /* Pre-allocate 256 blocks (512KB) */
 
 #define IPT2SOCKS_VERSION "ipt2socks v1.1.5 <https://github.com/zfl9/ipt2socks>"
 
@@ -124,6 +129,7 @@ static __thread udp_socks5ctx_t *g_udp_socks5ctx_table          = NULL;
 static __thread udp_socks5ctx_t *g_udp_fork_table               = NULL; // Fork table for collision handling
 static __thread udp_tproxyctx_t *g_udp_tproxyctx_table = NULL;
 static __thread char    g_udp_batch_buffer[UDP_BATCH_SIZE][UDP_DATAGRAM_MAXSIZ];
+static __thread memory_pool_t *g_udp_packet_pool = NULL; // Memory pool for UDP packet nodes
 
 static char      g_fakedns_ipstr[IP4STRLEN] = "127.0.0.1";
 static portno_t  g_fakedns_portno           = 5353;
@@ -497,6 +503,13 @@ static void on_signal_read(evloop_t *loop, evio_t *watcher, int revents __attrib
 static void* run_event_loop(void *is_main_thread) {
     evloop_t *evloop = ev_loop_new(0); // Restore original helper, we don't need default loop for ev_io
 
+    /* Initialize UDP packet memory pool (thread-local) */
+    g_udp_packet_pool = mempool_create(MEMPOOL_BLOCK_SIZE, MEMPOOL_INITIAL_SIZE);
+    if (!g_udp_packet_pool) {
+        LOGERR("[run_event_loop] failed to create memory pool");
+        exit(1);
+    }
+
     if (is_main_thread) {
          sigset_t mask;
          sigemptyset(&mask);
@@ -599,6 +612,10 @@ static void* run_event_loop(void *is_main_thread) {
     }
 
     ev_run(evloop, 0);
+    
+    /* Destroy memory pool before thread exits */
+    mempool_destroy(g_udp_packet_pool);
+    
     return NULL;
 }
 
@@ -1164,7 +1181,12 @@ static void handle_udp_socket_msg(evloop_t *evloop, evio_t *tprecv_watcher, stru
         *(uint16_t *)context->tcp_watcher.data = tfo_nsend; /* nsend or nrecv */
 
         /* tunnel not ready if udp_watcher->data != NULL */
-        udp_packet_node_t *node = malloc(sizeof(udp_packet_node_t) + headerlen + nrecv);
+        size_t node_size = sizeof(udp_packet_node_t) + headerlen + nrecv;
+        udp_packet_node_t *node = mempool_alloc_sized(g_udp_packet_pool, node_size);
+        if (!node) {
+            LOGERR("[udp_tproxy_recvmsg_cb] mempool_alloc_sized failed for %zu bytes", node_size);
+            return;
+        }
         node->next = NULL;
         node->len = headerlen + nrecv;
         memcpy(node->data, buffer, headerlen + nrecv);
@@ -1206,7 +1228,12 @@ static void handle_udp_socket_msg(evloop_t *evloop, evio_t *tprecv_watcher, stru
 
         LOGINF("[udp_tproxy_recvmsg_cb] tunnel is not ready, buffering this msg (queue: %zu)", queue->count);
         
-        udp_packet_node_t *node = malloc(sizeof(udp_packet_node_t) + headerlen + nrecv);
+        size_t node_size = sizeof(udp_packet_node_t) + headerlen + nrecv;
+        udp_packet_node_t *node = mempool_alloc_sized(g_udp_packet_pool, node_size);
+        if (!node) {
+            LOGERR("[udp_tproxy_recvmsg_cb] mempool_alloc_sized failed for %zu bytes", node_size);
+            return;
+        }
         node->next = NULL;
         node->len = headerlen + nrecv;
         memcpy(node->data, buffer, headerlen + nrecv);
@@ -1464,7 +1491,8 @@ static void udp_socks5_recv_proxyresp_cb(evloop_t *evloop, evio_t *tcp_watcher, 
             }
         }
         udp_packet_node_t *next = curr->next;
-        free(curr);
+        size_t node_size = sizeof(udp_packet_node_t) + curr->len;
+        mempool_free_sized(g_udp_packet_pool, curr, node_size);
         curr = next;
     }
     
