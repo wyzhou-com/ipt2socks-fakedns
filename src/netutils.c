@@ -304,10 +304,11 @@ int new_tcp_connect_sockfd(int family, uint8_t tcp_syncnt) {
     return sockfd;
 }
 
-int new_udp_tprecv_sockfd(int family) {
+int new_udp_tprecv_sockfd(int family, bool is_reuse_port) {
     int sockfd = new_nonblock_sockfd(family, SOCK_DGRAM);
     set_ip_transparent(family, sockfd);
     set_recv_origdstaddr(family, sockfd);
+    if (is_reuse_port) set_reuse_port(sockfd);
     return sockfd;
 }
 
