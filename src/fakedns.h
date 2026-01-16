@@ -14,6 +14,4 @@ size_t fakedns_process_query(const uint8_t *query, size_t qlen, uint8_t *buffer,
 void fakedns_save(const char *path);
 void fakedns_load(const char *path);
 
-void fakedns_get_stats(uint32_t *pool_size, uint32_t *pool_used, float *usage_percent);
-
 #endif

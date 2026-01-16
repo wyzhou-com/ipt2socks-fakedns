@@ -34,17 +34,6 @@ static const uint32_t FAKEDNS_TTL = 43200; // 12 hours
 #define FAKEDNS_POOL_WARN_THRESHOLD   0.80f  // 80% usage warning
 #define FAKEDNS_POOL_CRITICAL_THRESHOLD 0.95f  // 95% usage critical
 
-void fakedns_get_stats(uint32_t *pool_size, uint32_t *pool_used, float *usage_percent) {
-    pthread_rwlock_rdlock(&g_fakedns_rwlock);
-    if (pool_size) *pool_size = g_pool_size;
-    if (pool_used) *pool_used = g_pool_used;
-    if (usage_percent && g_pool_size > 0) {
-        *usage_percent = (float)g_pool_used / (float)g_pool_size * 100.0f;
-    }
-    pthread_rwlock_unlock(&g_fakedns_rwlock);
-}
-
-
 void fakedns_init(const char *cidr_str) {
     if (!cidr_str) {
         LOGERR("[fakedns_init] cidr_str is NULL");
@@ -142,7 +131,6 @@ uint32_t fakedns_lookup_domain(const char *domain) {
     
     // Reset offset for write path
     offset = offset_start;
-    now = time(NULL); // Refresh time
     
     for (uint32_t i = 0; i < g_pool_size; ++i) {
         uint32_t ip_host = g_fakeip_net_host + offset;
