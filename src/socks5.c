@@ -1,5 +1,5 @@
 #define _GNU_SOURCE
-#include "protocol.h"
+#include "socks5.h"
 #include "logutils.h"
 #include <stdbool.h>
 #include <stdint.h>

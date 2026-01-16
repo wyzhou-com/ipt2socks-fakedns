@@ -2,7 +2,7 @@ CC = gcc
 CFLAGS = -std=c99 -Wall -Wextra -Wvla -pthread -O3 -flto -fno-strict-aliasing -ffunction-sections -fdata-sections -DNDEBUG
 LDFLAGS = -pthread -O3 -flto -fno-strict-aliasing -Wl,--gc-sections -s
 LIBS = -lm
-SRCS = src/ipt2socks.c src/lrucache.c src/netutils.c src/protocol.c libev/ev.c src/fakedns.c src/xxhash.c src/logutils.c src/mempool.c
+SRCS = src/main.c src/ctx.c src/lrucache.c src/netutils.c src/socks5.c libev/ev.c src/fakedns.c src/xxhash.c src/logutils.c src/mempool.c src/udp_proxy.c src/tcp_proxy.c
 OBJS = $(SRCS:.c=.o)
 MAIN = ipt2socks
 DESTDIR = /usr/local/bin

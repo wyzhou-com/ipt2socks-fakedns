@@ -240,7 +240,7 @@ size_t fakedns_process_query(const uint8_t *query, size_t qlen, uint8_t *buffer,
     
     // Header parsing
     // ID (2), Flags (2), QDCOUNT (2), ANCOUNT (2), NSCOUNT (2), ARCOUNT (2)
-    uint16_t id = (query[0] << 8) | query[1];
+    //uint16_t id = (query[0] << 8) | query[1];
     uint16_t flags = (query[2] << 8) | query[3];
     uint16_t qdcount = (query[4] << 8) | query[5];
     
@@ -256,7 +256,9 @@ size_t fakedns_process_query(const uint8_t *query, size_t qlen, uint8_t *buffer,
     // Walk through QNAME
     char domain[256];
     size_t dom_len = 0;
+    size_t label_count = 0;
     while (offset < qlen) {
+        if (++label_count > 128) return 0; // Too many labels (loop limit safety)
         uint8_t len = query[offset];
         if (len == 0) {
             offset++;
