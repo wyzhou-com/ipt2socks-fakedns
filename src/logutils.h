@@ -8,52 +8,32 @@
 #include <stdatomic.h>
 
 extern bool g_verbose;
-#define IF_VERBOSE if (g_verbose)
+#define IF_VERBOSE if (unlikely(g_verbose))
 
-/* Cached time string (thread-safe) */
-extern char g_log_time_str[20];  /* "YYYY-MM-DD HH:MM:SS" */
-extern atomic_long g_log_time_epoch;
+#ifndef unlikely
+#define unlikely(x) __builtin_expect(!!(x), 0)
+#endif
 
-static inline void update_log_time(void) {
-    time_t now = time(NULL);
-    /* Only update when seconds change (avoid repeated conversion) */
-    if (now != atomic_load(&g_log_time_epoch)) {
-        atomic_store(&g_log_time_epoch, now);
-        struct tm tm;
-        localtime_r(&now, &tm);
-        snprintf(g_log_time_str, sizeof(g_log_time_str),
-                 "%04d-%02d-%02d %02d:%02d:%02d",
-                 tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday,
-                 tm.tm_hour, tm.tm_min, tm.tm_sec);
-    }
-}
+typedef enum {
+    LOG_LEVEL_INF,
+    LOG_LEVEL_ERR,
+    LOG_LEVEL_WAR,
+    LOG_LEVEL_ALWAYS_INF  /* Always output, behaves like old LOG_ALWAYS_INF */
+} log_level_t;
 
-#define LOG_ALWAYS_INF(fmt, ...)                                 \
-    do {                                                         \
-        update_log_time();                                       \
-        printf("\e[1;32m%s INF:\e[0m " fmt "\n",                 \
-               g_log_time_str, ##__VA_ARGS__);                   \
+void log_print(log_level_t level, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
+
+/* Optimized logging macros */
+/* Normal INFO logs: Checked against g_verbose with unlikely hint to minimize impact on hot paths */
+#define LOGINF(fmt, ...) \
+    do { \
+        if (unlikely(g_verbose)) { \
+            log_print(LOG_LEVEL_INF, fmt, ##__VA_ARGS__); \
+        } \
     } while (0)
 
-#define LOGINF(fmt, ...)           \
-    do {                           \
-        if (g_verbose) {           \
-             LOG_ALWAYS_INF(fmt, ##__VA_ARGS__); \
-        }                          \
-    } while (0)
-
-#define LOGERR(fmt, ...)                                         \
-    do {                                                         \
-        update_log_time();                                       \
-        printf("\e[1;35m%s ERR:\e[0m " fmt "\n",                 \
-               g_log_time_str, ##__VA_ARGS__);                   \
-    } while (0)
-
-#define LOGWAR(fmt, ...)                                         \
-    do {                                                         \
-        update_log_time();                                       \
-        printf("\e[1;33m%s WAR:\e[0m " fmt "\n",                 \
-               g_log_time_str, ##__VA_ARGS__);                   \
-    } while (0)
+#define LOGERR(fmt, ...) log_print(LOG_LEVEL_ERR, fmt, ##__VA_ARGS__)
+#define LOGWAR(fmt, ...) log_print(LOG_LEVEL_WAR, fmt, ##__VA_ARGS__)
+#define LOG_ALWAYS_INF(fmt, ...) log_print(LOG_LEVEL_ALWAYS_INF, fmt, ##__VA_ARGS__)
 
 #endif
