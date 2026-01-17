@@ -183,12 +183,11 @@ uint32_t fakedns_lookup_domain(const char *domain) {
                 // Match confirmed, update TTL
                 entry->expire = now + FAKEDNS_TTL;
                 pthread_rwlock_unlock(&g_fakedns_rwlock);
-                /* LOGINF("[fakedns] hit: %s -> %u.%u.%u.%u", domain, 
-                    ip_net & 0xFF, (ip_net >> 8) & 0xFF, (ip_net >> 16) & 0xFF, (ip_net >> 24) & 0xFF); */
+               
                 return ip_net;
             } else {
                 // Collision
-                /* Strategy A: Overwrite if expired */
+                // Strategy A: Overwrite if expired
                 if (entry->expire < now) {
                      LOGINF("[fakedns] overwrite expired entry: %s -> %s (IP: %u.%u.%u.%u)",
                             entry->domain, domain,
