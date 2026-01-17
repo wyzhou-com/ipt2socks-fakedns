@@ -257,6 +257,10 @@ static void handle_udp_socket_msg(evloop_t *evloop, evio_t *tprecv_watcher, stru
         udp_packet_node_t *node = mempool_alloc_sized(g_udp_packet_pool, node_size);
         if (!node) {
             LOGERR("[udp_tproxy_recvmsg_cb] mempool_alloc_sized failed for %zu bytes", node_size);
+            ev_io_stop(evloop, watcher);
+            close(tcp_sockfd);
+            free(context->tcp_watcher.data);
+            free(context);
             return;
         }
         node->next = NULL;
@@ -676,93 +680,30 @@ static void handle_udp_socks5_response(evloop_t *evloop, udp_socks5ctx_t *socks5
         return;
     }
 
-    /* For domain responses, we don't parse fromipport - we send back to the original requester */
-    /* The original requester is stored in socks5ctx->key_ipport */
-
-    if (isdomain) {
-        /* Domain response: need to bind to source address (FakeIP if available) */
-        /* Use pre-parsed domain_buf */
-        portno_t from_port;
-        memcpy(&from_port, (uint8_t *)buffer + 5 + domain_len, 2);
-        
-        /* Try to reverse lookup domain to FakeIP */
-        uint32_t fakeip = 0;
-        if (g_options & OPT_ENABLE_FAKEDNS) {
-            fakeip = fakedns_lookup_domain(domain_buf);
-        }
-        
-        if (!fakeip) {
-            /* No FakeIP for this domain, cannot send with proper source address */
-            LOGWAR("[udp_socks5_recv_udpmessage_cb] domain '%s' has no FakeIP mapping, cannot send response", domain_buf);
-            return;
-        }
-        
-        /* Create tproxy context with FakeIP as source */
-        ip_port_t fromipport = {.ip = {0}, .port = from_port};
-        fromipport.ip.ip4 = fakeip;
-        
-        udp_tproxyctx_t *tproxyctx = udp_tproxyctx_get(&g_udp_tproxyctx_table, &fromipport);
-        if (!tproxyctx) {
-            skaddr4_t fromskaddr = {0};
-            fromskaddr.sin_family = AF_INET;
-            fromskaddr.sin_addr.s_addr = fakeip;
-            fromskaddr.sin_port = from_port;
-            
-            int tproxy_sockfd = new_udp_tpsend_sockfd(AF_INET);
-            if (bind(tproxy_sockfd, (void *)&fromskaddr, sizeof(skaddr4_t)) < 0) {
-                LOGERR("[udp_socks5_recv_udpmessage_cb] bind tproxy reply address (FakeIP): %s", strerror(errno));
-                close(tproxy_sockfd);
-                return;
-            }
-            
-            tproxyctx = malloc(sizeof(*tproxyctx));
-            memcpy(&tproxyctx->key_ipport, &fromipport, sizeof(fromipport));
-            tproxyctx->udp_sockfd = tproxy_sockfd;
-            evtimer_t *timer = &tproxyctx->idle_timer;
-            ev_timer_init(timer, udp_tproxy_context_timeout_cb, 0, g_udp_idletimeout_sec);
-            udp_tproxyctx_t *del_context = udp_tproxyctx_add(&g_udp_tproxyctx_table, tproxyctx);
-            if (del_context) ev_invoke(evloop, &del_context->idle_timer, EV_CUSTOM);
-        }
-        ev_timer_again(evloop, &tproxyctx->idle_timer);
-        
-        /* Send response to original requester */
-        ip_port_t *toipport = &socks5ctx->key_ipport;
-        skaddr4_t toskaddr = {0};
-        toskaddr.sin_family = AF_INET;
-        toskaddr.sin_addr.s_addr = toipport->ip.ip4;
-        toskaddr.sin_port = toipport->port;
-        
-        size_t payload_len = nrecv - headerlen;
-        ssize_t nsend = sendto(tproxyctx->udp_sockfd, (void *)buffer + headerlen, payload_len, 0,
-                               (void *)&toskaddr, sizeof(skaddr4_t));
-        if (nsend < 0) {
-            char ipstr[IP6STRLEN]; portno_t portno;
-            parse_socket_addr((void *)&toskaddr, ipstr, &portno);
-            LOGERR("[udp_socks5_recv_udpmessage_cb] send to %s#%hu: %s", ipstr, portno, strerror(errno));
-        }
-        return;
-    }
-
-    /* For IP responses: use saved original destination (FakeIP/RealIP) */
-    /* For IP responses: determine source address based on mode */
+    /* Determine source address and port for the response packet */
     ip_port_t fromipport;
     bool dest_isipv4;
 
     if (g_options & OPT_ENABLE_FAKEDNS) {
-        /* [FakeDNS Enabled] Use saved original destination (FakeIP) to maintain mapping */
+        /* [FakeDNS Enabled] ALWAYS use saved original destination (FakeIP) to maintain mapping */
+        /* This handles IPv4, IPv6, and Domain responses by preserving the client's perspective */
         fromipport = socks5ctx->orig_dstaddr;
         dest_isipv4 = socks5ctx->dest_is_ipv4;
     } else {
-        /* [FakeDNS Disabled] Use actual source address from SOCKS5 payload (Standard Behavior) */
+        /* [FakeDNS Disabled] Use actual source address from SOCKS5 payload */
         if (isipv4) {
             fromipport.ip.ip4 = udp4msg->ipaddr4;
             fromipport.port = udp4msg->portnum;
             dest_isipv4 = true;
-        } else {
+        } else if (isipv6) {
             socks5_udp6msg_t *udp6msg = (void *)buffer;
             memcpy(&fromipport.ip.ip6, &udp6msg->ipaddr6, IP6BINLEN);
             fromipport.port = udp6msg->portnum;
             dest_isipv4 = false;
+        } else {
+            /* Domain response without FakeDNS: cannot TProxy bind to domain */
+            LOGWAR("[udp_socks5_recv_udpmessage_cb] domain response received but FakeDNS disabled, dropping");
+            return;
         }
     }
 
@@ -783,7 +724,14 @@ static void handle_udp_socks5_response(evloop_t *evloop, udp_socks5ctx_t *socks5
         }
         int tproxy_sockfd = new_udp_tpsend_sockfd(dest_isipv4 ? AF_INET : AF_INET6);
         if (bind(tproxy_sockfd, (void *)&fromskaddr, dest_isipv4 ? sizeof(skaddr4_t) : sizeof(skaddr6_t)) < 0) {
-            LOGERR("[udp_socks5_recv_udpmessage_cb] bind tproxy reply address: %s", strerror(errno));
+            if (dest_isipv4) {
+                 inet_ntop(AF_INET, &((skaddr4_t*)&fromskaddr)->sin_addr, ipstr, sizeof(ipstr));
+                 portno = ntohs(((skaddr4_t*)&fromskaddr)->sin_port);
+            } else {
+                 inet_ntop(AF_INET6, &fromskaddr.sin6_addr, ipstr, sizeof(ipstr));
+                 portno = ntohs(fromskaddr.sin6_port);
+            }
+            LOGERR("[udp_socks5_recv_udpmessage_cb] bind tproxy reply address %s#%d: %s", ipstr, portno, strerror(errno));
             close(tproxy_sockfd);
             return;
         }
