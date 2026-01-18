@@ -178,36 +178,53 @@ static void handle_udp_socket_msg(evloop_t *evloop, evio_t *tprecv_watcher, stru
 
     udp_socks5ctx_t *context = NULL;
     bool force_fork = false;
-    uint32_t target_ip = 0;
-    
-    if (isipv4) target_ip = ((skaddr4_t *)&skaddr)->sin_addr.s_addr;
 
-    if (fake_domain && (g_options & OPT_ENABLE_FAKEDNS) && isipv4) {
-        udp_fork_key_t fork_key;
-        memset(&fork_key, 0, sizeof(fork_key));
-        fork_key.client_ipport = key_ipport;
-        fork_key.target_ip = target_ip;
+    // Build fork key for unified lookup (works for IPv4 and IPv6, FakeDNS and standard)
+    udp_fork_key_t fork_key;
+    memset(&fork_key, 0, sizeof(fork_key));
+    fork_key.client_ipport = key_ipport;
+    fork_key.target_is_ipv4 = isipv4;
+    
+    if (isipv4) {
+        fork_key.target_ip.ip4 = ((skaddr4_t *)&skaddr)->sin_addr.s_addr;
+    } else {
+        memcpy(&fork_key.target_ip.ip6, &skaddr.sin6_addr.s6_addr, IP6BINLEN);
+    }
+
+    /* Step 1: Check Fork Table (precise match: client + target) */
+    context = udp_socks5ctx_fork_get(&g_udp_fork_table, &fork_key);
+
+    if (!context) {
+        /* Step 2: Check Main Table (fast path: first target from client) */
+        udp_socks5ctx_t *main_ctx = udp_socks5ctx_get(&g_udp_socks5ctx_table, &key_ipport);
         
-        /* 1. Check Fork Table first (Symmetric Path) */
-        context = udp_socks5ctx_fork_get(&g_udp_fork_table, &fork_key);
-        
-        if (!context) {
-            /* 2. Check Main Table (Cone Path) */
-            udp_socks5ctx_t *main_ctx = udp_socks5ctx_get(&g_udp_socks5ctx_table, &key_ipport);
-            if (main_ctx) {
-                /* Check if Target Matches */
-                if (main_ctx->dest_is_ipv4 && main_ctx->orig_dstaddr.ip.ip4 == target_ip) {
-                    /* Match! Safe to reuse Main Context */
-                    context = main_ctx;
+        if (main_ctx) {
+            /* Step 3: Check if target matches */
+            bool target_matches = false;
+            
+            // First check protocol family
+            if (main_ctx->dest_is_ipv4 == isipv4) {
+                if (isipv4) {
+                    target_matches = (main_ctx->orig_dstaddr.ip.ip4 == fork_key.target_ip.ip4);
                 } else {
-                    /* Collision detected! Client reusing port for diff Target. Force Fork. */
-                    force_fork = true;
+                    target_matches = (memcmp(&main_ctx->orig_dstaddr.ip.ip6,
+                                            &fork_key.target_ip.ip6, IP6BINLEN) == 0);
+                }
+            }
+            
+            if (target_matches) {
+                /* Target matches - safe to reuse Main Table association */
+                context = main_ctx;
+            } else {
+                /* Target differs - collision detected, must fork */
+                force_fork = true;
+                if (fake_domain) {
                     LOGINF("[udp_tproxy_recvmsg_cb] collision detected for %s, forcing fork", fake_domain);
+                } else {
+                    LOGINF("[udp_tproxy_recvmsg_cb] collision detected, forcing fork");
                 }
             }
         }
-    } else {
-        context = udp_socks5ctx_get(&g_udp_socks5ctx_table, &key_ipport);
     }
 
     if (!context) {
@@ -278,11 +295,19 @@ static void handle_udp_socket_msg(evloop_t *evloop, evio_t *tprecv_watcher, stru
         timer->data = (void *)sizeof(socks5_ipv4resp_t); // response_length
 
         udp_socks5ctx_t *del_context = NULL;
+        
+        // Always populate fork_key for all associations (needed for future Fork Table lookups)
+        context->fork_key.client_ipport = key_ipport;
+        context->fork_key.target_is_ipv4 = isipv4;
+        
+        if (isipv4) {
+            context->fork_key.target_ip.ip4 = ((skaddr4_t *)&skaddr)->sin_addr.s_addr;
+        } else {
+            memcpy(&context->fork_key.target_ip.ip6, &skaddr.sin6_addr.s6_addr, IP6BINLEN);
+        }
+        
         if (force_fork) {
             context->is_forked = true;
-            memset(&context->fork_key, 0, sizeof(context->fork_key));
-            context->fork_key.client_ipport = key_ipport;
-            context->fork_key.target_ip = target_ip;
             del_context = udp_socks5ctx_fork_add(&g_udp_fork_table, context);
         } else {
             context->is_forked = false;

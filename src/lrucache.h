@@ -7,7 +7,8 @@
 
 typedef struct {
     ip_port_t  client_ipport;
-    uint32_t   target_ip;
+    bool       target_is_ipv4;  // Protocol family flag for target
+    ipaddr_t   target_ip;       // Union: ip4 (32-bit) or ip6 (128-bit)
 } udp_fork_key_t;
 
 typedef struct {
