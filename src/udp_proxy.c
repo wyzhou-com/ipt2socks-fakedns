@@ -13,6 +13,10 @@
 #include <errno.h>
 #include <string.h>
 #include <arpa/inet.h>
+
+/* Fixed buffer size for SOCKS5 responses (enough for all response types) */
+#define SOCKS5_RESPONSE_MAX_SIZE 512
+
 #include <sys/socket.h>
 
 /* Forward declarations for static functions moved from ipt2socks.c */
@@ -266,7 +270,8 @@ static void handle_udp_socket_msg(evloop_t *evloop, evio_t *tprecv_watcher, stru
             tfo_nsend = tfo_nsend >= 0 ? tfo_nsend : 0;
         }
         ev_io_start(evloop, watcher);
-        context->tcp_watcher.data = malloc(2 + sizeof(socks5_ipv6resp_t));
+        context->tcp_watcher.data = malloc(SOCKS5_RESPONSE_MAX_SIZE);
+        context->idle_timer.data = (void *)(SOCKS5_RESPONSE_MAX_SIZE - 2);
         *(uint16_t *)context->tcp_watcher.data = tfo_nsend; /* nsend or nrecv */
 
         /* tunnel not ready if udp_watcher->data != NULL */
@@ -530,22 +535,33 @@ static void udp_socks5_recv_proxyresp_cb(evloop_t *evloop, evio_t *tcp_watcher, 
             *(uint16_t *)tcp_watcher->data = sizeof(socks5_ipv4resp_t); // response_nrecv
             return;
         } else if (((socks5_ipv4resp_t *)(tcp_watcher->data + 2))->addrtype == SOCKS5_ADDRTYPE_DOMAIN) {
-            uint8_t domain_len = ((socks5_domainresp_t *)(tcp_watcher->data + 2))->domain_len;
-            size_t total_len = sizeof(socks5_domainreq_t) + domain_len + 2; // header(4) + len(1) + domain(n) + port(2)
-            
-            if (total_len > (uintptr_t)context->idle_timer.data) {
-                // Need to expand buffer
-                void *new_buf = realloc(tcp_watcher->data, 2 + total_len);
-                if (!new_buf) {
-                     LOGERR("[udp_socks5_recv_proxyresp_cb] realloc failed");
-                     udp_socks5ctx_release(evloop, context);
-                     return;
-                }
-                tcp_watcher->data = new_buf;
-                context->idle_timer.data = (void *)total_len;
-                *(uint16_t *)tcp_watcher->data = sizeof(socks5_ipv4resp_t); // response_nrecv
+            /* Security: Ensure domain_len field has been received */
+            if (*(uint16_t *)tcp_watcher->data < sizeof(socks5_ipv4resp_t) + 1) {
+                /* domain_len not yet received, wait for next callback */
                 return;
             }
+            
+            uint8_t domain_len = ((socks5_domainresp_t *)(tcp_watcher->data + 2))->domain_len;
+            
+            /* Security: Validate domain_len (DNS max is 253) */
+            if (domain_len == 0 || domain_len > 253) {
+                LOGERR("[udp_socks5_recv_proxyresp_cb] invalid domain_len: %u", domain_len);
+                udp_socks5ctx_release(evloop, context);
+                return;
+            }
+            
+            size_t total_len = sizeof(socks5_domainreq_t) + domain_len + 2; // header(4) + len(1) + domain(n) + port(2)
+            
+            /* Check if response fits in fixed buffer */
+            if (total_len > (uintptr_t)context->idle_timer.data) {
+                LOGERR("[udp_socks5_recv_proxyresp_cb] response too large: %zu bytes", total_len);
+                udp_socks5ctx_release(evloop, context);
+                return;
+            }
+            
+            /* Update expected length and continue receiving */
+            context->idle_timer.data = (void *)total_len;
+            *(uint16_t *)tcp_watcher->data = sizeof(socks5_ipv4resp_t); // response_nrecv
         }
     }
     portno_t relay_port;
@@ -656,149 +672,7 @@ static void udp_socks5_recv_tcpmessage_cb(evloop_t *evloop, evio_t *tcp_watcher,
 }
 
 
-static void handle_udp_socks5_response(evloop_t *evloop, udp_socks5ctx_t *socks5ctx, char *buffer, ssize_t nrecv) {
-    if ((size_t)nrecv < sizeof(socks5_udp4msg_t)) {
-        LOGERR("[udp_socks5_recv_udpmessage_cb] recv from socks5 server: message too small");
-        return;
-    }
-    socks5_udp4msg_t *udp4msg = (void *)buffer;
-    bool isipv4 = udp4msg->addrtype == SOCKS5_ADDRTYPE_IPV4;
-    bool isipv6 = udp4msg->addrtype == SOCKS5_ADDRTYPE_IPV6;
-    bool isdomain = udp4msg->addrtype == SOCKS5_ADDRTYPE_DOMAIN;
-
-    /* Parse address and calculate header length */
-    size_t headerlen;
-    char domain_buf[256];
-    uint8_t domain_len = 0;
-
-    if (isipv4) {
-        headerlen = sizeof(socks5_udp4msg_t);
-        if ((size_t)nrecv < headerlen) {
-            LOGERR("[udp_socks5_recv_udpmessage_cb] recv from socks5 server: message too small");
-            return;
-        }
-    } else if (isipv6) {
-        headerlen = sizeof(socks5_udp6msg_t);
-        if ((size_t)nrecv < headerlen) {
-            LOGERR("[udp_socks5_recv_udpmessage_cb] recv from socks5 server: message too small");
-            return;
-        }
-    } else if (isdomain) {
-        /* Domain format: [reserved(2)] [fragment(1)] [addrtype(1)] [len(1)] [domain(n)] [port(2)] */
-        if ((size_t)nrecv < 5) {
-            LOGERR("[udp_socks5_recv_udpmessage_cb] recv from socks5 server: domain message too small");
-            return;
-        }
-        domain_len = ((uint8_t *)buffer)[4];
-        headerlen = 4 + 1 + domain_len + 2;
-        if ((size_t)nrecv < headerlen) {
-            LOGERR("[udp_socks5_recv_udpmessage_cb] recv from socks5 server: domain message truncated");
-            return;
-        }
-        
-        /* Optimization: Parse domain once and reuse */
-        memcpy(domain_buf, (uint8_t *)buffer + 5, domain_len);
-        domain_buf[domain_len] = '\0';
-        LOGINF("[udp_socks5_recv_udpmessage_cb] recv domain response: %s, nrecv:%zd", domain_buf, nrecv);
-    } else {
-        LOGERR("[udp_socks5_recv_udpmessage_cb] unsupported address type: 0x%02x", udp4msg->addrtype);
-        return;
-    }
-
-    /* Determine source address and port for the response packet */
-    ip_port_t fromipport;
-    bool dest_isipv4;
-
-    if (g_options & OPT_ENABLE_FAKEDNS) {
-        /* [FakeDNS Enabled] ALWAYS use saved original destination (FakeIP) to maintain mapping */
-        /* This handles IPv4, IPv6, and Domain responses by preserving the client's perspective */
-        fromipport = socks5ctx->orig_dstaddr;
-        dest_isipv4 = socks5ctx->dest_is_ipv4;
-    } else {
-        /* [FakeDNS Disabled] Use actual source address from SOCKS5 payload */
-        if (isipv4) {
-            fromipport.ip.ip4 = udp4msg->ipaddr4;
-            fromipport.port = udp4msg->portnum;
-            dest_isipv4 = true;
-        } else if (isipv6) {
-            socks5_udp6msg_t *udp6msg = (void *)buffer;
-            memcpy(&fromipport.ip.ip6, &udp6msg->ipaddr6, IP6BINLEN);
-            fromipport.port = udp6msg->portnum;
-            dest_isipv4 = false;
-        } else {
-            /* Domain response without FakeDNS: cannot TProxy bind to domain */
-            LOGWAR("[udp_socks5_recv_udpmessage_cb] domain response received but FakeDNS disabled, dropping");
-            return;
-        }
-    }
-
-    char ipstr[IP6STRLEN]; portno_t portno;
-
-    udp_tproxyctx_t *tproxyctx = udp_tproxyctx_get(&g_udp_tproxyctx_table, &fromipport);
-    if (!tproxyctx) {
-        skaddr6_t fromskaddr = {0};
-        if (dest_isipv4) {
-            skaddr4_t *addr = (void *)&fromskaddr;
-            addr->sin_family = AF_INET;
-            addr->sin_addr.s_addr = fromipport.ip.ip4;
-            addr->sin_port = fromipport.port;
-        } else {
-            fromskaddr.sin6_family = AF_INET6;
-            memcpy(&fromskaddr.sin6_addr.s6_addr, &fromipport.ip.ip6, IP6BINLEN);
-            fromskaddr.sin6_port = fromipport.port;
-        }
-        int tproxy_sockfd = new_udp_tpsend_sockfd(dest_isipv4 ? AF_INET : AF_INET6);
-        if (bind(tproxy_sockfd, (void *)&fromskaddr, dest_isipv4 ? sizeof(skaddr4_t) : sizeof(skaddr6_t)) < 0) {
-            if (dest_isipv4) {
-                 inet_ntop(AF_INET, &((skaddr4_t*)&fromskaddr)->sin_addr, ipstr, sizeof(ipstr));
-                 portno = ntohs(((skaddr4_t*)&fromskaddr)->sin_port);
-            } else {
-                 inet_ntop(AF_INET6, &fromskaddr.sin6_addr, ipstr, sizeof(ipstr));
-                 portno = ntohs(fromskaddr.sin6_port);
-            }
-            LOGERR("[udp_socks5_recv_udpmessage_cb] bind tproxy reply address %s#%d: %s", ipstr, portno, strerror(errno));
-            close(tproxy_sockfd);
-            return;
-        }
-        tproxyctx = malloc(sizeof(*tproxyctx));
-        if (!tproxyctx) {
-             LOGERR("[udp_socks5_recv_udpmessage_cb] malloc failed for tproxyctx");
-             close(tproxy_sockfd);
-             return;
-        }
-        memcpy(&tproxyctx->key_ipport, &fromipport, sizeof(fromipport));
-        tproxyctx->udp_sockfd = tproxy_sockfd;
-        evtimer_t *timer = &tproxyctx->idle_timer;
-        ev_timer_init(timer, udp_tproxy_context_timeout_cb, 0, g_udp_idletimeout_sec);
-        udp_tproxyctx_t *del_context = udp_tproxyctx_add(&g_udp_tproxyctx_table, tproxyctx);
-        if (del_context) ev_invoke(evloop, &del_context->idle_timer, EV_CUSTOM);
-    }
-    ev_timer_again(evloop, &tproxyctx->idle_timer);
-
-    ip_port_t *toipport = &socks5ctx->key_ipport;
-    skaddr6_t toskaddr = {0};
-    if (dest_isipv4) {
-        skaddr4_t *addr = (void *)&toskaddr;
-        addr->sin_family = AF_INET;
-        addr->sin_addr.s_addr = toipport->ip.ip4;
-        addr->sin_port = toipport->port;
-    } else {
-        toskaddr.sin6_family = AF_INET6;
-        memcpy(&toskaddr.sin6_addr.s6_addr, &toipport->ip.ip6, IP6BINLEN);
-        toskaddr.sin6_port = toipport->port;
-    }
-
-    nrecv = sendto(tproxyctx->udp_sockfd, (void *)buffer + headerlen, nrecv - headerlen, 0, (void *)&toskaddr, dest_isipv4 ? sizeof(skaddr4_t) : sizeof(skaddr6_t));
-    if (nrecv < 0) {
-        parse_socket_addr(&toskaddr, ipstr, &portno);
-        LOGERR("[udp_socks5_recv_udpmessage_cb] send to %s#%hu: %s", ipstr, portno, strerror(errno));
-        return;
-    }
-    parse_socket_addr(&toskaddr, ipstr, &portno);
-#ifdef ENABLE_SENDTO_LOG
-    LOGINF("[udp_socks5_recv_udpmessage_cb] send to %s#%hu, nsend:%zd", ipstr, portno, nrecv);
-#endif
-}
+/* Removed: handle_udp_socks5_response - logic inlined into batch callback below */
 
 static void udp_socks5_recv_udpmessage_cb(evloop_t *evloop, evio_t *udp_watcher, int revents __attribute__((unused))) {
     udp_socks5ctx_t *socks5ctx = (void *)udp_watcher - offsetof(udp_socks5ctx_t, udp_watcher);
@@ -829,9 +703,213 @@ static void udp_socks5_recv_udpmessage_cb(evloop_t *evloop, evio_t *udp_watcher,
         return;
     }
     
+    /* Process batch and prepare for sendmmsg */
+    struct {
+        udp_tproxyctx_t *ctx;
+        struct mmsghdr msg;
+        struct iovec iov;
+        skaddr6_t addr;
+        char *data;
+        size_t len;
+    } batch_sends[UDP_BATCH_SIZE];
+    int send_count = 0;
+    
     for (int i = 0; i < retval; i++) {
-        /* Process each received packet */
-        handle_udp_socks5_response(evloop, socks5ctx, g_udp_batch_buffer[i], msgs[i].msg_len);
+        char *buffer = g_udp_batch_buffer[i];
+        ssize_t nrecv = msgs[i].msg_len;
+        
+        /* Parse SOCKS5 header - inline logic from handle_udp_socks5_response */
+        if ((size_t)nrecv < sizeof(socks5_udp4msg_t)) continue;
+        
+        socks5_udp4msg_t *udp4msg = (void *)buffer;
+        bool isipv4 = udp4msg->addrtype == SOCKS5_ADDRTYPE_IPV4;
+        bool isipv6 = udp4msg->addrtype == SOCKS5_ADDRTYPE_IPV6;
+        bool isdomain = udp4msg->addrtype == SOCKS5_ADDRTYPE_DOMAIN;
+        
+        size_t headerlen;
+        if (isipv4) {
+            headerlen = sizeof(socks5_udp4msg_t);
+            if ((size_t)nrecv < headerlen) continue;
+        } else if (isipv6) {
+            headerlen = sizeof(socks5_udp6msg_t);
+            if ((size_t)nrecv < headerlen) continue;
+        } else if (isdomain) {
+            if ((size_t)nrecv < 5) continue;
+            uint8_t domain_len = ((uint8_t *)buffer)[4];
+            headerlen = 4 + 1 + domain_len + 2;
+            if ((size_t)nrecv < headerlen) continue;
+        } else {
+            continue;
+        }
+        
+        /* Determine source (bind) address */
+        ip_port_t fromipport;
+        bool dest_isipv4;
+        
+        if (g_options & OPT_ENABLE_FAKEDNS) {
+            fromipport = socks5ctx->orig_dstaddr;
+            dest_isipv4 = socks5ctx->dest_is_ipv4;
+        } else {
+            if (isipv4) {
+                fromipport.ip.ip4 = udp4msg->ipaddr4;
+                fromipport.port = udp4msg->portnum;
+                dest_isipv4 = true;
+            } else if (isipv6) {
+                socks5_udp6msg_t *udp6msg = (void *)buffer;
+                memcpy(&fromipport.ip.ip6, &udp6msg->ipaddr6, IP6BINLEN);
+                fromipport.port = udp6msg->portnum;
+                dest_isipv4 = false;
+            } else {
+                continue;  /* Domain without FakeDNS */
+            }
+        }
+        
+        /* Get or create tproxy context */
+        udp_tproxyctx_t *tproxyctx = udp_tproxyctx_get(&g_udp_tproxyctx_table, &fromipport);
+        if (!tproxyctx) {
+            skaddr6_t fromskaddr = {0};
+            if (dest_isipv4) {
+                skaddr4_t *addr = (void *)&fromskaddr;
+                addr->sin_family = AF_INET;
+                addr->sin_addr.s_addr = fromipport.ip.ip4;
+                addr->sin_port = fromipport.port;
+            } else {
+                fromskaddr.sin6_family = AF_INET6;
+                memcpy(&fromskaddr.sin6_addr.s6_addr, &fromipport.ip.ip6, IP6BINLEN);
+                fromskaddr.sin6_port = fromipport.port;
+            }
+            int tproxy_sockfd = new_udp_tpsend_sockfd(dest_isipv4 ? AF_INET : AF_INET6);
+            if (bind(tproxy_sockfd, (void *)&fromskaddr, dest_isipv4 ? sizeof(skaddr4_t) : sizeof(skaddr6_t)) < 0) {
+                close(tproxy_sockfd);
+                continue;
+            }
+            tproxyctx = malloc(sizeof(*tproxyctx));
+            if (!tproxyctx) {
+                close(tproxy_sockfd);
+                continue;
+            }
+            memcpy(&tproxyctx->key_ipport, &fromipport, sizeof(fromipport));
+            tproxyctx->udp_sockfd = tproxy_sockfd;
+            evtimer_t *timer = &tproxyctx->idle_timer;
+            ev_timer_init(timer, udp_tproxy_context_timeout_cb, 0, g_udp_idletimeout_sec);
+            udp_tproxyctx_t *del_context = udp_tproxyctx_add(&g_udp_tproxyctx_table, tproxyctx);
+            if (del_context) ev_invoke(evloop, &del_context->idle_timer, EV_CUSTOM);
+        }
+        ev_timer_again(evloop, &tproxyctx->idle_timer);
+        
+        /* Prepare destination address */
+        ip_port_t *toipport = &socks5ctx->key_ipport;
+        if (dest_isipv4) {
+            skaddr4_t *addr = (void *)&batch_sends[send_count].addr;
+            addr->sin_family = AF_INET;
+            addr->sin_addr.s_addr = toipport->ip.ip4;
+            addr->sin_port = toipport->port;
+        } else {
+            batch_sends[send_count].addr.sin6_family = AF_INET6;
+            memcpy(&batch_sends[send_count].addr.sin6_addr.s6_addr, &toipport->ip.ip6, IP6BINLEN);
+            batch_sends[send_count].addr.sin6_port = toipport->port;
+        }
+        
+        /* Prepare send message */
+        batch_sends[send_count].ctx = tproxyctx;
+        batch_sends[send_count].data = buffer + headerlen;
+        batch_sends[send_count].len = nrecv - headerlen;
+        batch_sends[send_count].iov.iov_base = batch_sends[send_count].data;
+        batch_sends[send_count].iov.iov_len = batch_sends[send_count].len;
+        batch_sends[send_count].msg.msg_hdr.msg_name = &batch_sends[send_count].addr;
+        batch_sends[send_count].msg.msg_hdr.msg_namelen = dest_isipv4 ? sizeof(skaddr4_t) : sizeof(skaddr6_t);
+        batch_sends[send_count].msg.msg_hdr.msg_iov = &batch_sends[send_count].iov;
+        batch_sends[send_count].msg.msg_hdr.msg_iovlen = 1;
+        batch_sends[send_count].msg.msg_hdr.msg_control = NULL;
+        batch_sends[send_count].msg.msg_hdr.msg_controllen = 0;
+        
+        send_count++;
+        if (send_count >= UDP_BATCH_SIZE) break;  /* Safety: prevent overflow */
+    }
+    
+    /* Batch send using sendmmsg - group by tproxy socket */
+    if (send_count > 0) {
+        /* Sort by socket fd to maximize batch efficiency */
+        int fd_groups = 0;
+        for (int i = 0; i < send_count; ) {
+            udp_tproxyctx_t *ctx = batch_sends[i].ctx;
+            int group_start = i;
+            int group_count = 0;
+            
+            /* Find all messages for this socket */
+            for (int j = i; j < send_count; j++) {
+                if (batch_sends[j].ctx == ctx) {
+                    if (j != i + group_count) {
+                        /* Swap using memcpy for C99 compatibility */
+                        char tmpbuf[sizeof(batch_sends[0])];
+                        memcpy(tmpbuf, &batch_sends[i + group_count], sizeof(batch_sends[0]));
+                        batch_sends[i + group_count] = batch_sends[j];
+                        memcpy(&batch_sends[j], tmpbuf, sizeof(batch_sends[0]));
+                    }
+                    group_count++;
+                }
+            }
+            
+            /* Send batch for this socket */
+            struct mmsghdr *group_msgs = malloc(sizeof(struct mmsghdr) * group_count);
+            if (group_msgs) {
+                for (int k = 0; k < group_count; k++) {
+                    group_msgs[k] = batch_sends[group_start + k].msg;
+                }
+                
+                int sent = sendmmsg(ctx->udp_sockfd, group_msgs, group_count, 0);
+                if (sent < 0) {
+                    LOGERR("[udp_socks5_recv_udpmessage_cb] sendmmsg failed: %s", strerror(errno));
+                } else {
+                #ifdef ENABLE_SENDTO_LOG
+                    char ipstr[IP6STRLEN];
+                    ip_port_t *client = &socks5ctx->key_ipport;
+                    /* Use dest protocol family as heuristic (client usually matches target) */
+                    if (socks5ctx->dest_is_ipv4) {
+                        inet_ntop(AF_INET, &client->ip.ip4, ipstr, sizeof(ipstr));
+                    } else {
+                        inet_ntop(AF_INET6, &client->ip.ip6, ipstr, sizeof(ipstr));
+                    }
+                    LOGINF("[udp_socks5_recv_udpmessage_cb] sendmmsg to %s#%hu: %d packets sent", 
+                           ipstr, ntohs(client->port), sent);
+                #endif
+                    if (sent < group_count) {
+                        /* Fallback for unsent */
+                        LOGWAR("[udp_socks5_recv_udpmessage_cb] partial send %d/%d, using fallback", sent, group_count);
+                        for (int k = sent; k < group_count; k++) {
+                            struct msghdr *hdr = &group_msgs[k].msg_hdr;
+                            ssize_t n = sendto(ctx->udp_sockfd, hdr->msg_iov[0].iov_base, 
+                                   hdr->msg_iov[0].iov_len, 0, hdr->msg_name, hdr->msg_namelen);
+                            #ifdef ENABLE_SENDTO_LOG
+                            if (n > 0) {
+                                char ipstr[IP6STRLEN]; portno_t portno;
+                                parse_socket_addr((skaddr6_t *)hdr->msg_name, ipstr, &portno);
+                                LOGINF("[udp_socks5_recv_udpmessage_cb] fallback sendto %s#%hu, nsend:%zd", ipstr, portno, n);
+                            }
+                            #endif
+                            if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
+                                LOGERR("[udp_socks5_recv_udpmessage_cb] fallback sendto failed: %s", strerror(errno));
+                            }
+                        }
+                    }
+                }
+                free(group_msgs);
+            } else {
+                /* malloc failed - fallback to individual sends */
+                LOGWAR("[udp_socks5_recv_udpmessage_cb] malloc failed, using individual sends for %d packets", group_count);
+                for (int k = 0; k < group_count; k++) {
+                    struct msghdr *hdr = &batch_sends[group_start + k].msg.msg_hdr;
+                    ssize_t n = sendto(ctx->udp_sockfd, hdr->msg_iov[0].iov_base, 
+                           hdr->msg_iov[0].iov_len, 0, hdr->msg_name, hdr->msg_namelen);
+                    if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
+                        LOGERR("[udp_socks5_recv_udpmessage_cb] malloc-fallback sendto failed: %s", strerror(errno));
+                    }
+                }
+            }
+            
+            i += group_count;
+            fd_groups++;
+        }
     }
     
     /* Optimization: Update LRU only once per batch */
