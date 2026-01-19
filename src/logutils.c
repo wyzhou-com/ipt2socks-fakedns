@@ -2,8 +2,8 @@
 #include "logutils.h"
 #include <stdarg.h>
 
-static char g_log_time_str[20] = "0000-00-00 00:00:00";
-static atomic_long g_log_time_epoch = 0;
+static __thread char g_log_time_str[32] = "0000-00-00 00:00:00";
+static __thread atomic_long g_log_time_epoch = 0;
 
 static inline void update_log_time(void) {
     time_t now = time(NULL);
@@ -41,6 +41,7 @@ void log_print(log_level_t level, const char *fmt, ...) {
             break;
     }
 
+    flockfile(stdout);
     printf("%s%s %s:\e[0m ", color, g_log_time_str, label);
 
     va_list args;
@@ -49,4 +50,5 @@ void log_print(log_level_t level, const char *fmt, ...) {
     va_end(args);
 
     printf("\n");
+    funlockfile(stdout);
 }
