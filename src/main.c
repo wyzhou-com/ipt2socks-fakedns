@@ -32,7 +32,7 @@
 #include "udp_proxy.h"
 #include "tcp_proxy.h"
 
-#define IPT2SOCKS_VERSION "ipt2socks v1.1.5 <https://github.com/zfl9/ipt2socks>\nipt2socks-fakedns v1.0.7 <https://github.com/wyzhou-com/ipt2socks-fakedns>"
+#define IPT2SOCKS_VERSION "ipt2socks v1.1.5 <https://github.com/zfl9/ipt2socks>\nipt2socks-fakedns v1.0.8 <https://github.com/wyzhou-com/ipt2socks-fakedns>"
 
 /* enum OPT_* moved to ctx.h */
 
