@@ -366,7 +366,9 @@ static void tcp_stream_payload_forward_cb(evloop_t *evloop, evio_t *self_watcher
         ssize_t nrecv = splice(self_watcher->fd, NULL, self_pipefd[1], NULL, TCP_SPLICE_MAXLEN, SPLICE_F_MOVE | SPLICE_F_NONBLOCK);
         if (nrecv < 0) {
             if (errno != EAGAIN && errno != EWOULDBLOCK) {
-                LOGERR("[tcp_stream_payload_forward_cb] recv from %s stream: %s", self_is_client ? "client" : "socks5", strerror(errno));
+                IF_VERBOSE {
+                    LOGERR("[tcp_stream_payload_forward_cb] recv from %s stream: %s", self_is_client ? "client" : "socks5", strerror(errno));
+                }
                 tcp_context_release(evloop, context, true);
                 return;
             }
