@@ -438,6 +438,17 @@ static void* run_event_loop(void *is_main_thread) {
         LOGERR("[run_event_loop] failed to create context memory pool");
         exit(1);
     }
+    
+    /* 3. TCP Context Pool (fixed-sized, unlimited max blocks) */
+    g_tcp_context_pool = mempool_create(
+        sizeof(tcp_context_t),
+        128, /* initial blocks */
+        0    /* unlimited max blocks */
+    );
+    if (!g_tcp_context_pool) {
+        LOGERR("[run_event_loop] failed to create tcp context memory pool");
+        exit(1);
+    }
 
     if (is_main_thread) {
          sigset_t mask;
@@ -546,14 +557,18 @@ static void* run_event_loop(void *is_main_thread) {
     if (g_options & OPT_ENABLE_UDP) {
         udp_proxy_close_all_sessions(evloop);
     }
+    if (g_options & OPT_ENABLE_TCP) {
+        tcp_proxy_close_all_sessions(evloop);
+    }
     
     /* Destroy memory pools and check for leaks */
     size_t pkt_leaks = mempool_destroy(g_udp_packet_pool);
     size_t ctx_leaks = mempool_destroy(g_udp_context_pool);
+    size_t tcp_leaks = mempool_destroy(g_tcp_context_pool);
     
-    if (pkt_leaks > 0 || ctx_leaks > 0) {
-        LOGERR("[run_event_loop] memory leaks detected: packet_pool=%zu, context_pool=%zu", 
-               pkt_leaks, ctx_leaks);
+    if (pkt_leaks > 0 || ctx_leaks > 0 || tcp_leaks > 0) {
+        LOGERR("[run_event_loop] memory leaks detected: packet=%zu, udp_ctx=%zu, tcp_ctx=%zu", 
+               pkt_leaks, ctx_leaks, tcp_leaks);
     }
     
     return NULL;

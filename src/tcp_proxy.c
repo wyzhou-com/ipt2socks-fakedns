@@ -58,16 +58,27 @@ static inline void tcp_context_release(evloop_t *evloop, tcp_context_t *context,
         close(client_watcher->fd);
         close(socks5_watcher->fd);
     }
-    if (client_watcher->data || socks5_watcher->data) {
-        free(client_watcher->data);
-        free(socks5_watcher->data);
-    } else {
-        close(context->client_pipefd[0]);
-        close(context->client_pipefd[1]);
-        close(context->socks5_pipefd[0]);
-        close(context->socks5_pipefd[1]);
+    // No need to free watcher.data as they point to embedded buffer
+    if (context->client_pipefd[0] != -1) close(context->client_pipefd[0]);
+    if (context->client_pipefd[1] != -1) close(context->client_pipefd[1]);
+    if (context->socks5_pipefd[0] != -1) close(context->socks5_pipefd[0]);
+    if (context->socks5_pipefd[1] != -1) close(context->socks5_pipefd[1]);
+    
+    /* Remove from session list */
+    if (context->next) context->next->prev = context->prev;
+    if (context->prev) context->prev->next = context->next;
+    else g_tcp_session_head = context->next;
+    
+    mempool_free_sized(g_tcp_context_pool, context, sizeof(tcp_context_t));
+}
+
+void tcp_proxy_close_all_sessions(evloop_t *evloop) {
+    tcp_context_t *curr = (tcp_context_t *)g_tcp_session_head;
+    while (curr) {
+        tcp_context_t *next = curr->next;
+        tcp_context_release(evloop, curr, false);
+        curr = next;
     }
-    free(context);
 }
 
 void tcp_tproxy_accept_cb(evloop_t *evloop, evio_t *accept_watcher, int revents __attribute__((unused))) {
@@ -112,14 +123,22 @@ void tcp_tproxy_accept_cb(evloop_t *evloop, evio_t *accept_watcher, int revents 
         LOGINF("[tcp_tproxy_accept_cb] try to connect to %s#%hu ...", g_server_ipstr, g_server_portno);
     }
 
-    tcp_context_t *context = malloc(sizeof(*context));
+    tcp_context_t *context = mempool_alloc_sized(g_tcp_context_pool, sizeof(tcp_context_t));
     if (!context) {
-        LOGERR("[tcp_tproxy_accept_cb] malloc failed");
+        LOGERR("[tcp_tproxy_accept_cb] mempool_alloc failed");
         tcp_close_by_rst(client_sockfd);
         close(socks5_sockfd);
         return;
     }
     memset(context, 0, sizeof(*context));
+    context->client_pipefd[0] = context->client_pipefd[1] = -1;
+    context->socks5_pipefd[0] = context->socks5_pipefd[1] = -1;
+    
+    /* Add to session list (prepend) */
+    context->prev = NULL;
+    context->next = (tcp_context_t *)g_tcp_session_head;
+    if (context->next) context->next->prev = context;
+    g_tcp_session_head = context;
 
     /* if (watcher->events & EV_CUSTOM); then it is client watcher; fi */
     evio_t *watcher = &context->client_watcher;
@@ -136,10 +155,8 @@ void tcp_tproxy_accept_cb(evloop_t *evloop, evio_t *accept_watcher, int revents 
         }
     }
     
-    size_t reqlen_est = (fake_domain) ? (sizeof(socks5_domainreq_t) + strlen(fake_domain) + 2) : 
-                        (isipv4 ? sizeof(socks5_ipv4req_t) : sizeof(socks5_ipv6req_t));
-    
-    context->client_watcher.data = malloc(reqlen_est);
+    /* Use embedded buffer for request (offset 0) */
+    context->client_watcher.data = context->handshake_buf;
     
     size_t actual_len = 0;
     socks5_proxy_request_make(context->client_watcher.data, &skaddr, fake_domain, &actual_len);
@@ -155,7 +172,8 @@ void tcp_tproxy_accept_cb(evloop_t *evloop, evio_t *accept_watcher, int revents 
     }
     ev_io_start(evloop, watcher);
 
-    context->socks5_watcher.data = malloc(sizeof(socks5_ipv6resp_t));
+    /* Use embedded buffer for response (offset 300, providing 300 bytes space) */
+    context->socks5_watcher.data = context->handshake_buf + 300;
     context->socks5_length = (size_t)tfo_nsend;
 }
 
@@ -312,15 +330,17 @@ static void tcp_socks5_recv_proxyresp_cb(evloop_t *evloop, evio_t *socks5_watche
              return;
         }
         
-        /* Expand buffer if needed */
+        /* Ensure buffer size for big domain */
+        if (total_len > 300) {
+              LOGERR("[tcp_socks5_recv_proxyresp_cb] response too large: %zu", total_len);
+              tcp_context_release(evloop, context, true);
+              return;
+        }
+
         if (total_len > 5) {
-            void *new_buf = realloc(socks5_watcher->data, total_len);
-            if (!new_buf) {
-                LOGERR("[tcp_socks5_recv_proxyresp_cb] realloc failed");
-                tcp_context_release(evloop, context, true);
-                return;
-            }
-            socks5_watcher->data = new_buf;
+            /* We are using embedded buffer, no realloc needed as we reserved 300 bytes.
+             * context->socks5_watcher.data already points to handshake_buf + 300.
+             */
             
             /* Update length targets */
             context->client_length = total_len;
@@ -342,10 +362,7 @@ static void tcp_socks5_recv_proxyresp_cb(evloop_t *evloop, evio_t *socks5_watche
     
     // ... remainder of function ...
 
-    free(socks5_watcher->data);
     socks5_watcher->data = NULL;
-
-    free(context->client_watcher.data);
     context->client_watcher.data = NULL;
 
     new_nonblock_pipefd(context->client_pipefd);
