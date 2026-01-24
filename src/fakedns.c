@@ -41,6 +41,7 @@ static const uint32_t FAKEDNS_TTL = 43200; // 12 hours
 // Pool usage warning thresholds
 #define FAKEDNS_POOL_WARN_THRESHOLD   0.80f  // 80% usage warning
 #define FAKEDNS_POOL_CRITICAL_THRESHOLD 0.95f  // 95% usage critical
+#define FAKEDNS_MAX_PROBES 128
 
 void fakedns_init(const char *cidr_str) {
     if (!cidr_str) {
@@ -106,7 +107,7 @@ uint32_t fakedns_lookup_domain(const char *domain) {
     // Phase 1: Try read lock first for fast path (cache hit with valid TTL)
     pthread_rwlock_rdlock(&g_fakedns_rwlock);
     
-    for (uint32_t i = 0; i < g_pool_size; ++i) {
+    for (uint32_t i = 0; i < FAKEDNS_MAX_PROBES; ++i) {
         uint32_t ip_host = g_fakeip_net_host + offset;
         uint32_t ip_net = htonl(ip_host);
         
@@ -143,7 +144,7 @@ uint32_t fakedns_lookup_domain(const char *domain) {
     // Reset offset for write path
     offset = offset_start;
     
-    for (uint32_t i = 0; i < g_pool_size; ++i) {
+    for (uint32_t i = 0; i < FAKEDNS_MAX_PROBES; ++i) {
         uint32_t ip_host = g_fakeip_net_host + offset;
         uint32_t ip_net = htonl(ip_host);
         
@@ -220,7 +221,7 @@ uint32_t fakedns_lookup_domain(const char *domain) {
     }
     
     pthread_rwlock_unlock(&g_fakedns_rwlock);
-    LOGERR("[fakedns_lookup_domain] linear probe exhausted for domain: %s", domain);
+    LOGERR("[fakedns_lookup_domain] max probes (%d) exhausted for domain: %s", FAKEDNS_MAX_PROBES, domain);
     return 0;
 }
 
