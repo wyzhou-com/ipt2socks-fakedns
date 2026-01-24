@@ -97,6 +97,9 @@ uint32_t fakedns_lookup_domain(const char *domain) {
 
     uint64_t hash = XXH3_64bits(domain, strlen(domain));
     uint32_t offset_start = (uint32_t)(hash % g_pool_size);
+    /* Double Hashing: Use upper 32 bits as step size. Must be odd (coprime to power-of-2 size). */
+    uint32_t step = (uint32_t)(hash >> 32) | 1; 
+
     uint32_t offset = offset_start;
     time_t now = time(NULL);
     
@@ -127,8 +130,8 @@ uint32_t fakedns_lookup_domain(const char *domain) {
             // TTL low, need to update - break to acquire write lock
             break;
         } else {
-            // Collision, continue probing
-            offset = (offset + 1) % g_pool_size;
+            // Collision, continue probing (Double Hashing)
+            offset = (offset + step) % g_pool_size;
         }
     }
     
@@ -210,8 +213,8 @@ uint32_t fakedns_lookup_domain(const char *domain) {
                      return ip_net;
                 }
                 
-                // Still valid, linear probe
-                offset = (offset + 1) % g_pool_size;
+                // Still valid, linear probe (Double Hashing)
+                offset = (offset + step) % g_pool_size;
             }
         }
     }
