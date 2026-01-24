@@ -1,10 +1,8 @@
 # ipt2socks with FakeDNS Support
 
-> **注意**：基于原版 `ipt2socks` 进行了增强，新增了 **FakeDNS** 功能。
+### 内置 FakeDNS 增强
 
-## 内置 FakeDNS 增强
-
-集成了专为透明代理环境深度优化的 FakeDNS 模块，并且与常规 FakeDNS 方案相比本方案拥有以下优点：
+集成了专为透明代理环境深度优化的 FakeDNS 模块，可作为一个通用的 Tproxy 前端为不支持 FakeDNS 的上游提供服务。且相较常规 FakeDNS 方案本方案拥有以下优点：
 
 1. **稳定映射**
 
@@ -17,6 +15,48 @@
 3. **无感重启**
 
     得益于以上两个特性，本方案保证了客户端和服务端 DNS 数据的一致性和连续性，服务重启不会导致连接中断。无需等待或手动刷新 DNS 缓存，实现了无感重启。
+   
+### 对原版的增强
+
+实现了多线程 UDP 和 `recvmmsg()` `sendmmsg()` 批量收发，并使用内存池替代原版的 `malloc` 动态内存分配，相比原版 UDP 处理能力有较大提升。
+
+## 关于使用场景的重要说明
+>
+> **推荐的使用场景：**
+>
+>使用 FakeDNS 解析特定的域名列表（如 GFWlist），并通过 `iptables` 或 `nftables` 将 FakeIP 网段的流量导入 Tproxy，正常流量完全不经过 ipt2socks。
+>
+> **不推荐的使用场景：**
+>
+>将所有 DNS 查询劫持到 FakeDNS 并将所有流量导入 Tproxy 通过上游软件进行分流。
+>
+>**原因：**
+> 
+>为了实现稳定映射程序使用了一种高质量的哈希函数计算 FakeIP，但 IP 地址池是有限的，哈希函数有可能出现碰撞冲突，这意味着两个或多个不同的域名计算出了相同的 FakeIP，程序需要处理这些冲突。
+>
+>同时考虑到程序有可能运行在路由设备上，为了节约内存占用程序使用了一种并不高效的数据结构来存储映射数据，在这种数据结构下如果要处理过多的冲突将消耗较高的 CPU 资源，为了防止耗尽 CPU 资源程序对冲突处理做了限制，如果超过限制将会报错。
+>
+>作者对常用的超过 2.5 万个 GFWlist 域名（包含子域）做了碰撞测试，结果如下：
+>
+```bash
+Starting collision test (Double Hashing)...
+Pool Size: 131072 slots
+------------------------------------------------
+Test Results:
+Total Domains Processed: 25710
+Pool Capacity:           131072
+Load Factor:             19.62%
+------------------------------------------------
+Direct Collisions:       2569
+Collision Rate:          9.9922%
+Safe Domains:            23141 (90.01%)
+------------------------------------------------
+Probe Statistics (Double Hashing):
+Max Probe Steps:         5
+Avg Probe Steps (All):   0.1145
+Avg Probe Steps (Coll):  1.1464
+```
+>可以发现，即使将全部超过 2.5 万个 GFWlist 域名交给 FakeDNS 处理最大冲突处理步数也只有 5 步，不会有任何性能问题，在实际使用中 FakeIP 很少超过 1000 个。但是如果你将所有 DNS 查询都交给 FakeDNS 长期运行就无法保证了。
 
 ### 参数说明
 
@@ -159,3 +199,4 @@ usage: ipt2socks <options...>. the existing options are as follows:
 由于透明代理需要消耗较多文件描述符，为确保最佳体验，请务必留意 ipt2socks 的 nofile limit（可同时打开的文件描述符数量），默认的 nofile limit 非常小，对于透明代理场景基本是不够用的。
 
 从 v1.1.4 版本开始，ipt2socks 启动时将打印进程的 nofile limit 信息，请确保这个值至少在 10000 以上（很多系统默认是 1024），你可以选择使用 `-n` 选项调整此限制（需要 CAP_SYS_RESOURCE 权限），也可以使用其他方式，如 systemd service 文件的 `LimitNOFILE`、`/etc/security/limits.conf` 配置文件。
+
