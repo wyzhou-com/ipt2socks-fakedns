@@ -6,7 +6,7 @@
 #include <stdbool.h>
 
 void fakedns_init(const char *cidr_str);
-uint32_t fakedns_lookup_domain(const char *domain);
+uint32_t fakedns_lookup_domain(const char *domain, size_t len);
 bool fakedns_reverse_lookup(uint32_t ip, char *buffer, size_t buf_len);
 
 size_t fakedns_process_query(const uint8_t *query, size_t qlen, uint8_t *buffer, size_t buflen);

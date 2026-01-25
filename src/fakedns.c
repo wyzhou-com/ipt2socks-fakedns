@@ -93,10 +93,10 @@ void fakedns_init(const char *cidr_str) {
            FAKEDNS_POOL_CRITICAL_THRESHOLD * 100.0f, (uint32_t)(g_pool_size * FAKEDNS_POOL_CRITICAL_THRESHOLD));
 }
 
-uint32_t fakedns_lookup_domain(const char *domain) {
+uint32_t fakedns_lookup_domain(const char *domain, size_t len) {
     if (!domain || !g_pool_size) return 0;
 
-    uint64_t hash = XXH3_64bits(domain, strlen(domain));
+    uint64_t hash = XXH3_64bits(domain, len);
     uint32_t offset_start = (uint32_t)(hash % g_pool_size);
     /* Double Hashing: Use upper 32 bits as step size. Must be odd (coprime to power-of-2 size). */
     uint32_t step = (uint32_t)(hash >> 32) | 1; 
@@ -128,8 +128,12 @@ uint32_t fakedns_lookup_domain(const char *domain) {
                 return ip_net;
             }
             
-            // TTL low, need to update - break to acquire write lock
-            break;
+            // Optimistic Update: Use atomic store to update TTL under READ lock
+            // This avoids upgrading to write lock for simple refresh
+            __atomic_store_n(&entry->expire, now + FAKEDNS_TTL, __ATOMIC_RELAXED);
+            
+            pthread_rwlock_unlock(&g_fakedns_rwlock);
+            return ip_net;
         } else {
             // Collision, continue probing (Double Hashing)
             offset = (offset + step) % g_pool_size;
@@ -337,7 +341,7 @@ size_t fakedns_process_query(const uint8_t *query, size_t qlen, uint8_t *buffer,
     size_t resp_len = offset + 4;
     
     if (qtype == 1) { /* A Record */
-        uint32_t fakeip = fakedns_lookup_domain(domain);
+        uint32_t fakeip = fakedns_lookup_domain(domain, dom_len);
         if (fakeip) {
             // Add Answer
             // Ptr to name (0xC00C - Offset 12)
