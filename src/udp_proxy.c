@@ -45,9 +45,9 @@ void udp_tproxy_recvmsg_cb(evloop_t *evloop, evio_t *tprecv_watcher, int revents
     char msg_control_buffers[UDP_BATCH_SIZE][UDP_CTRLMESG_BUFSIZ];
     skaddr6_t skaddrs[UDP_BATCH_SIZE];
 
-    memset(msgs, 0, sizeof(msgs));
-    memset(iovs, 0, sizeof(iovs));
-    memset(msg_control_buffers, 0, sizeof(msg_control_buffers));
+    /* memset(msgs, 0, sizeof(msgs)); */
+    /* memset(iovs, 0, sizeof(iovs)); */
+    /* memset(msg_control_buffers, 0, sizeof(msg_control_buffers)); */
 
     for (int i = 0; i < UDP_BATCH_SIZE; i++) {
         iovs[i].iov_base = (void *)g_udp_batch_buffer[i] + max_headerlen;
@@ -59,6 +59,8 @@ void udp_tproxy_recvmsg_cb(evloop_t *evloop, evio_t *tprecv_watcher, int revents
         msgs[i].msg_hdr.msg_iovlen = 1;
         msgs[i].msg_hdr.msg_control = msg_control_buffers[i];
         msgs[i].msg_hdr.msg_controllen = UDP_CTRLMESG_BUFSIZ;
+        msgs[i].msg_hdr.msg_flags = 0;
+        msgs[i].msg_len = 0;
     }
 
     /* non-blocking receive */
@@ -740,17 +742,14 @@ static void udp_socks5_recv_tcpmessage_cb(evloop_t *evloop, evio_t *tcp_watcher,
     }
 }
 
-
-/* Removed: handle_udp_socks5_response - logic inlined into batch callback below */
-
 static void udp_socks5_recv_udpmessage_cb(evloop_t *evloop, evio_t *udp_watcher, int revents __attribute__((unused))) {
     udp_socks5ctx_t *socks5ctx = (void *)udp_watcher - offsetof(udp_socks5ctx_t, udp_watcher);
     
     struct mmsghdr msgs[UDP_BATCH_SIZE];
     struct iovec iovs[UDP_BATCH_SIZE];
     
-    memset(msgs, 0, sizeof(msgs));
-    memset(iovs, 0, sizeof(iovs));
+    /* memset(msgs, 0, sizeof(msgs)); */
+    /* memset(iovs, 0, sizeof(iovs)); */
     
     /* Prepare for recvmmsg batch receive */
     for (int i = 0; i < UDP_BATCH_SIZE; i++) {
@@ -761,6 +760,10 @@ static void udp_socks5_recv_udpmessage_cb(evloop_t *evloop, evio_t *udp_watcher,
         msgs[i].msg_hdr.msg_iovlen = 1;
         msgs[i].msg_hdr.msg_name = NULL; /* Connected socket, no address needed */
         msgs[i].msg_hdr.msg_namelen = 0;
+        msgs[i].msg_hdr.msg_control = NULL;
+        msgs[i].msg_hdr.msg_controllen = 0;
+        msgs[i].msg_hdr.msg_flags = 0;
+        msgs[i].msg_len = 0;
     }
 
     int retval = recvmmsg(udp_watcher->fd, msgs, UDP_BATCH_SIZE, MSG_DONTWAIT, NULL);
@@ -900,21 +903,24 @@ static void udp_socks5_recv_udpmessage_cb(evloop_t *evloop, evio_t *udp_watcher,
     /* Batch send using sendmmsg - group by tproxy socket */
     if (send_count > 0) {
         /* Sort by socket fd to maximize batch efficiency */
+        /* Optimization: Use indirect sorting (indices) to avoid memcpy of large structures */
+        uint16_t indices[UDP_BATCH_SIZE];
+        for (int k = 0; k < send_count; k++) indices[k] = k;
+
         int fd_groups = 0;
         for (int i = 0; i < send_count; ) {
-            udp_tproxyctx_t *ctx = batch_sends[i].ctx;
+            udp_tproxyctx_t *ctx = batch_sends[indices[i]].ctx;
             int group_start = i;
             int group_count = 0;
             
             /* Find all messages for this socket */
             for (int j = i; j < send_count; j++) {
-                if (batch_sends[j].ctx == ctx) {
+                if (batch_sends[indices[j]].ctx == ctx) {
                     if (j != i + group_count) {
-                        /* Swap using memcpy for C99 compatibility */
-                        char tmpbuf[sizeof(batch_sends[0])];
-                        memcpy(tmpbuf, &batch_sends[i + group_count], sizeof(batch_sends[0]));
-                        memcpy(&batch_sends[i + group_count], &batch_sends[j], sizeof(batch_sends[0]));
-                        memcpy(&batch_sends[j], tmpbuf, sizeof(batch_sends[0]));
+                        /* Swap indices only */
+                        uint16_t tmp = indices[i + group_count];
+                        indices[i + group_count] = indices[j];
+                        indices[j] = tmp;
                     }
                     group_count++;
                 }
@@ -924,9 +930,10 @@ static void udp_socks5_recv_udpmessage_cb(evloop_t *evloop, evio_t *udp_watcher,
             struct mmsghdr group_msgs[UDP_BATCH_SIZE];
             
             for (int k = 0; k < group_count; k++) {
-                group_msgs[k].msg_hdr.msg_name       = &batch_sends[group_start + k].addr;
-                group_msgs[k].msg_hdr.msg_namelen    = batch_sends[group_start + k].msg.msg_hdr.msg_namelen;
-                group_msgs[k].msg_hdr.msg_iov        = &batch_sends[group_start + k].iov;
+                int idx = indices[group_start + k];
+                group_msgs[k].msg_hdr.msg_name       = &batch_sends[idx].addr;
+                group_msgs[k].msg_hdr.msg_namelen    = batch_sends[idx].msg.msg_hdr.msg_namelen;
+                group_msgs[k].msg_hdr.msg_iov        = &batch_sends[idx].iov;
                 group_msgs[k].msg_hdr.msg_iovlen     = 1;
                 group_msgs[k].msg_hdr.msg_control    = NULL;
                 group_msgs[k].msg_hdr.msg_controllen = 0;
