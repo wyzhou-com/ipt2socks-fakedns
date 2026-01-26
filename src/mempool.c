@@ -26,7 +26,8 @@ memory_pool_t* mempool_create(size_t block_size, size_t initial_blocks, size_t m
         return NULL;
     }
     
-    pool->block_size = block_size;
+    /* Align block size to 64 bytes (cache line) for optimal performance */
+    pool->block_size = (block_size + 63) & ~63;
     pool->max_blocks = (max_blocks == 0) ? SIZE_MAX : max_blocks;  /* 0 = unlimited */
     pool->total_blocks = 0;
     pool->free_blocks = 0;
@@ -38,9 +39,10 @@ memory_pool_t* mempool_create(size_t block_size, size_t initial_blocks, size_t m
     
     /* Pre-allocate initial blocks */
     for (size_t i = 0; i < initial_blocks; i++) {
-        void *block = malloc(block_size);
-        if (!block) {
-            LOGWAR("[mempool] failed to pre-allocate block %zu/%zu", i, initial_blocks);
+        void *block = NULL;
+        /* improved alignment for cache line (64 bytes) optimization */
+        if (posix_memalign(&block, 64, pool->block_size) != 0) {
+            LOGWAR("[mempool] failed to pre-allocate aligned block %zu/%zu", i, initial_blocks);
             break;
         }
         
@@ -52,8 +54,8 @@ memory_pool_t* mempool_create(size_t block_size, size_t initial_blocks, size_t m
     }
     
     LOG_ALWAYS_INF("[mempool] created: block_size=%zu, initial=%zu, max=%zu, memory=%zu KB", 
-           block_size, pool->total_blocks, pool->max_blocks,
-           (block_size * pool->total_blocks) / 1024);
+           pool->block_size, pool->total_blocks, pool->max_blocks,
+           (pool->block_size * pool->total_blocks) / 1024);
     return pool;
 }
 
@@ -77,12 +79,11 @@ void* mempool_alloc_sized(memory_pool_t *pool, size_t size) {
     } else {
         /* Free list empty, try dynamic expansion */
         if (pool->total_blocks < pool->max_blocks) {
-            block = malloc(pool->block_size);
-            if (block) {
+            if (posix_memalign(&block, 64, pool->block_size) == 0) {
                 pool->total_blocks++;
                 LOGINF("[mempool] expanded: %zu/%zu", pool->total_blocks, pool->max_blocks);
             } else {
-                LOGERR("[mempool] malloc failed during expansion");
+                LOGERR("[mempool] posix_memalign failed during expansion");
                 return NULL;
             }
         } else {
