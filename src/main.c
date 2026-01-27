@@ -530,6 +530,11 @@ static void* run_event_loop(void *arg) {
             }
 
             tcp4_watcher = malloc(sizeof(*tcp4_watcher));
+            if (!tcp4_watcher) {
+                LOGERR("[run_event_loop] malloc tcp4_watcher failed");
+                exit_code = ENOMEM;
+                goto cleanup;
+            }
             tcp4_watcher->data = (void *)1;
             ev_io_init(tcp4_watcher, tcp_tproxy_accept_cb, tcp4_sockfd, EV_READ);
             ev_io_start(evloop, tcp4_watcher);
@@ -550,6 +555,11 @@ static void* run_event_loop(void *arg) {
             }
 
             tcp6_watcher = malloc(sizeof(*tcp6_watcher));
+            if (!tcp6_watcher) {
+                LOGERR("[run_event_loop] malloc tcp6_watcher failed");
+                exit_code = ENOMEM;
+                goto cleanup;
+            }
             tcp6_watcher->data = NULL;
             ev_io_init(tcp6_watcher, tcp_tproxy_accept_cb, tcp6_sockfd, EV_READ);
             ev_io_start(evloop, tcp6_watcher);
@@ -569,6 +579,11 @@ static void* run_event_loop(void *arg) {
             }
 
             udp4_watcher = malloc(sizeof(*udp4_watcher));
+            if (!udp4_watcher) {
+                LOGERR("[run_event_loop] malloc udp4_watcher failed");
+                exit_code = ENOMEM;
+                goto cleanup;
+            }
             udp4_watcher->data = (void *)1;
             ev_io_init(udp4_watcher, udp_tproxy_recvmsg_cb, udp4_sockfd, EV_READ);
             ev_io_start(evloop, udp4_watcher);
@@ -584,6 +599,11 @@ static void* run_event_loop(void *arg) {
             }
 
             udp6_watcher = malloc(sizeof(*udp6_watcher));
+            if (!udp6_watcher) {
+                LOGERR("[run_event_loop] malloc udp6_watcher failed");
+                exit_code = ENOMEM;
+                goto cleanup;
+            }
             udp6_watcher->data = NULL;
             ev_io_init(udp6_watcher, udp_tproxy_recvmsg_cb, udp6_sockfd, EV_READ);
             ev_io_start(evloop, udp6_watcher);
@@ -598,6 +618,11 @@ static void* run_event_loop(void *arg) {
             goto cleanup;
         }
         fakedns_watcher = malloc(sizeof(*fakedns_watcher));
+        if (!fakedns_watcher) {
+            LOGERR("[run_event_loop] malloc fakedns_watcher failed");
+            exit_code = ENOMEM;
+            goto cleanup;
+        }
         ev_io_init(fakedns_watcher, udp_dns_recv_cb, fakedns_sockfd, EV_READ);
         ev_io_start(evloop, fakedns_watcher);
     }

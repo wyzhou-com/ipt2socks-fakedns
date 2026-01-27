@@ -323,6 +323,13 @@ static void handle_udp_socket_msg(evloop_t *evloop, evio_t *tprecv_watcher, stru
         }
         ev_io_start(evloop, watcher);
         context->tcp_watcher.data = malloc(SOCKS5_RESPONSE_MAX_SIZE);
+        if (!context->tcp_watcher.data) {
+            LOGERR("[udp_tproxy_recvmsg_cb] malloc failed for SOCKS5 response buffer");
+            ev_io_stop(evloop, watcher);
+            close(tcp_sockfd);
+            mempool_free_sized(g_udp_context_pool, context, sizeof(*context));
+            return;
+        }
         context->idle_timer.data = (void *)(SOCKS5_RESPONSE_MAX_SIZE - 2);
         *(uint16_t *)context->tcp_watcher.data = tfo_nsend; /* nsend or nrecv */
 
