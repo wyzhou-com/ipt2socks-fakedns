@@ -29,7 +29,7 @@
 #include <sys/types.h>
 #include <unistd.h>
 
-#define IPT2SOCKS_VERSION "ipt2socks original <https://github.com/zfl9/ipt2socks>\nipt2socks-fakedns v1.1.3 <https://github.com/wyzhou-com/ipt2socks-fakedns>"
+#define IPT2SOCKS_VERSION "ipt2socks original <https://github.com/zfl9/ipt2socks>\nipt2socks-fakedns v1.1.4 <https://github.com/wyzhou-com/ipt2socks-fakedns>"
 
 static void* run_event_loop(void *is_main_thread);
 
