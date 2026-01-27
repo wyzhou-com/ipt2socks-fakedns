@@ -330,6 +330,11 @@ static void tcp_socks5_recv_proxyresp_cb(evloop_t *evloop, evio_t *socks5_watche
             total_len = sizeof(socks5_ipv6resp_t); // 22
         } else if (atype == SOCKS5_ADDRTYPE_DOMAIN) {
             uint8_t domain_len = ((socks5_domainresp_t *)socks5_watcher->data)->domain_len;
+            if (domain_len == 0 || domain_len > 253) {
+                 LOGERR("[tcp_socks5_recv_proxyresp_cb] invalid domain_len: %u", domain_len);
+                 tcp_context_release(evloop, context, true);
+                 return;
+            }
             total_len = sizeof(socks5_domainresp_t) + domain_len + 2;
         } else {
              LOGERR("[tcp_socks5_recv_proxyresp_cb] unsupported address type: 0x%02x", atype);

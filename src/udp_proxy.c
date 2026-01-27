@@ -87,6 +87,7 @@ static char *build_socks5_udp_header(char *payload_start, const char *fake_domai
     if (fake_domain) {
         /* DOMAIN format: [reserved(2)][fragment(1)][addrtype(1)][len(1)][domain(n)][port(2)] */
         size_t domain_len = strlen(fake_domain);
+        if (domain_len > MAX_DOMAIN_LEN) domain_len = MAX_DOMAIN_LEN; // Defense in depth
         
         actual_headerlen = 4 + 1 + domain_len + 2;
         header_start = payload_start - actual_headerlen;
@@ -138,8 +139,11 @@ static void handle_udp_socket_msg(evloop_t *evloop, evio_t *tprecv_watcher, stru
     /* Restore skaddr from msg->msg_name (sender address) */
     if (msg->msg_namelen == sizeof(skaddr4_t)) {
         memcpy(&skaddr, msg->msg_name, sizeof(skaddr4_t));
-    } else {
+    } else if (msg->msg_namelen == sizeof(skaddr6_t)) {
         memcpy(&skaddr, msg->msg_name, sizeof(skaddr6_t));
+    } else {
+        LOGERR("[udp_tproxy_recvmsg_cb] invalid msg_namelen: %d", (int)msg->msg_namelen);
+        return;
     }
 
     IF_VERBOSE {
@@ -343,7 +347,6 @@ static void handle_udp_socket_msg(evloop_t *evloop, evio_t *tprecv_watcher, stru
             mempool_free_sized(g_udp_packet_pool, node, node_size);
             ev_io_stop(evloop, watcher);
             close(tcp_sockfd);
-            free(context->tcp_watcher.data);
             free(context->tcp_watcher.data);
             mempool_free_sized(g_udp_context_pool, context, sizeof(*context));
             return;
